@@ -71,74 +71,129 @@ def play_seeya():
     threading.Thread(target=run, daemon=True).start()
 
 
-# ------------- SYNTH BEEPS (zero-dependency state change chimes) -------------
+# ------------- SYNTH BEEPS (pre-generated WAV files → afplay, no sd conflict) -------------
 
-def _synth_tone(start_hz: float, end_hz: float, duration_sec: float = 0.25, volume: float = 0.35):
-    """Play a short sine-wave tone that glides from start_hz to end_hz. Non-blocking."""
-    def run():
-        try:
-            sr = 22050
-            n = int(sr * duration_sec)
-            t = np.linspace(0, duration_sec, n, endpoint=False)
-            # Linear frequency glide
-            freq = np.linspace(start_hz, end_hz, n)
-            phase = np.cumsum(2 * np.pi * freq / sr)
-            wave = np.sin(phase).astype(np.float32) * volume
-            # Quick fade-in/out to avoid clicks
-            fade = min(int(sr * 0.02), n // 4)
-            if fade > 0:
-                env = np.ones(n, dtype=np.float32)
-                env[:fade] = np.linspace(0, 1, fade)
-                env[-fade:] = np.linspace(1, 0, fade)
-                wave *= env
-            sd.play(wave, samplerate=sr, blocking=False)
-        except Exception as e:
-            print(f"[audio] synth_tone failed: {e}")
-    threading.Thread(target=run, daemon=True).start()
+def _write_chirp_wav(path: str, start_hz: float, end_hz: float, duration_sec: float, volume: float = 0.6):
+    """Generate a sine-wave chirp WAV file at `path` (no-op if file already exists)."""
+    if os.path.exists(path):
+        return
+    sr = 22050
+    n = int(sr * duration_sec)
+    freq = np.linspace(start_hz, end_hz, n)
+    phase = np.cumsum(2 * np.pi * freq / sr)
+    wave = np.sin(phase).astype(np.float32) * volume
+    fade = min(int(sr * 0.02), n // 4)
+    if fade > 0:
+        env = np.ones(n, dtype=np.float32)
+        env[:fade] = np.linspace(0, 1, fade)
+        env[-fade:] = np.linspace(1, 0, fade)
+        wave *= env
+    pcm16 = (wave * 32767).astype(np.int16)
+    try:
+        import wave as _wave
+        with _wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(pcm16.tobytes())
+    except Exception as e:
+        print(f"[audio] chirp write failed: {e}")
+
+
+_CHIRP_DIR = os.path.join(os.path.dirname(__file__), "assets", "_chirps")
+os.makedirs(_CHIRP_DIR, exist_ok=True)
+_CHIRP_GESTURES_OFF = os.path.join(_CHIRP_DIR, "gestures_off.wav")
+_CHIRP_VOICE_OVERLAY = os.path.join(_CHIRP_DIR, "voice_overlay.wav")
+_CHIRP_RESUMED = os.path.join(_CHIRP_DIR, "resumed.wav")
+_write_chirp_wav(_CHIRP_GESTURES_OFF, 720, 380, 0.25)
+_write_chirp_wav(_CHIRP_VOICE_OVERLAY, 700, 1100, 0.18)
+_write_chirp_wav(_CHIRP_RESUMED, 520, 680, 0.20)
+
+
+def _synth_tone(start_hz: float = None, end_hz: float = None,
+                duration_sec: float = 0.25, volume: float = 0.5):
+    """Legacy no-op — kept so old callers don't error. Use one of the beep_* fns."""
+    pass
 
 
 def beep_gestures_on():
-    """Ascending chirp — gestures turning on."""
-    _synth_tone(420, 720, duration_sec=0.22)
+    """Gestures turning on — short welcome chime (uses welcome.wav for natural feel)."""
+    def run():
+        p = _play_async(WELCOME, volume=0.55)
+        if p:
+            _current_procs.append(p)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def beep_gestures_off():
-    """Descending chirp — gestures turning off."""
-    _synth_tone(720, 380, duration_sec=0.22)
+    """Gestures off — descending chirp via afplay."""
+    def run():
+        p = _play_async(_CHIRP_GESTURES_OFF, volume=0.55)
+        if p:
+            _current_procs.append(p)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def beep_voice_on_overlay():
-    """Quick double-click — voice turning on while gestures already on."""
-    _synth_tone(600, 900, duration_sec=0.12)
-    threading.Timer(0.16, lambda: _synth_tone(800, 1100, duration_sec=0.12)).start()
+    """Voice on while gestures already on — rising chirp via afplay."""
+    def run():
+        p = _play_async(_CHIRP_VOICE_OVERLAY, volume=0.5)
+        if p:
+            _current_procs.append(p)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def beep_gestures_resumed():
-    """Soft single note — gestures reactivate after voice-off."""
-    _synth_tone(520, 680, duration_sec=0.18)
+    """Voice off, gestures resuming — soft ascending note via afplay."""
+    def run():
+        p = _play_async(_CHIRP_RESUMED, volume=0.45)
+        if p:
+            _current_procs.append(p)
+    threading.Thread(target=run, daemon=True).start()
 
 
 # ------------- CLAP DETECTION -------------
 
 class ClapDetector:
     """Consumes audio chunks from the shared `mic` broker.
-    Two close-together loud peaks within (min_gap, max_gap) fire on_double_clap."""
+    Two close-together sharp peaks within (min_gap, max_gap) fire on_double_clap.
 
-    def __init__(self, threshold=0.15, min_gap=0.18, max_gap=0.8, on_double_clap=None):
+    Sharp vs voice: a clap is a very short attack (<30 ms) with high peak/rms
+    ratio; speech is sustained. We gate on both (a) a high RMS threshold,
+    (b) a high peak/rms ratio, and (c) a post-startup silence grace so the
+    stream warmup doesn't look like a clap.
+    """
+
+    def __init__(self, threshold=0.28, min_gap=0.18, max_gap=0.8,
+                 peak_to_rms_min=3.0, startup_grace_sec=2.0, on_double_clap=None):
         self.threshold = threshold
         self.min_gap = min_gap
         self.max_gap = max_gap
+        self.peak_to_rms_min = peak_to_rms_min
+        self.startup_grace_sec = startup_grace_sec
         self.on_double_clap = on_double_clap
         self.last_peak_ts = 0.0
         self.peak_count = 0
         self._running = False
+        self._start_ts = 0.0
 
     def _on_chunk(self, chunk: np.ndarray):
         if not self._running:
             return
-        rms = float(np.sqrt(np.mean(chunk ** 2)))
         now = time.time()
-        if rms > self.threshold:
+        # Ignore the first couple seconds after startup — mic warmup produces clicks
+        if now - self._start_ts < self.startup_grace_sec:
+            return
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        peak = float(np.max(np.abs(chunk)))
+        # Require both a loud peak AND that peak be much louder than the rms
+        # (claps are transients; speech is not).
+        is_clap_like = (
+            peak > self.threshold
+            and rms > 0
+            and (peak / rms) >= self.peak_to_rms_min
+        )
+        if is_clap_like:
             gap_since_last = now - self.last_peak_ts
             if gap_since_last < self.min_gap:
                 return
@@ -159,6 +214,7 @@ class ClapDetector:
         if self._running:
             return
         self._running = True
+        self._start_ts = time.time()
         import mic as _mic
         if not _mic.is_started():
             _mic.start()
