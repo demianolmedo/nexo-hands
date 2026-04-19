@@ -138,9 +138,10 @@ def _focus_pid(pid: int):
         pass
 
 
-# TTS provider: "gemini" (Gemini 3.1 Flash TTS Preview via REST, JARVIS-grade)
-# or "mac" (macOS `say`, offline). Gemini fails back to mac on any error.
-TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "gemini").lower()
+# TTS provider: "mac" (Paulina es_MX, gratis, default preferido) o "gemini"
+# (Gemini 3.1 Flash TTS Preview via REST, $0.005 por respuesta). Mac es el
+# default porque al usuario le gusta la voz y no cuesta nada.
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "mac").lower()
 # Gemini voices (prebuilt): Orus, Charon, Fenrir = deep male.
 # Zephyr, Puck, Algieba, Enceladus = other male options. Full list in docs.
 TTS_MODEL_GEMINI = os.environ.get("TTS_MODEL_GEMINI", "gemini-3.1-flash-tts-preview")
@@ -443,8 +444,9 @@ def _today_spanish() -> str:
 
 
 def exec_query_web(question: str) -> str:
-    """Answer a conversational query via REST Gemini + macOS `say`. Uses
-    thinking_level=high for better reasoning on nuanced questions."""
+    """Answer a conversational query via REST Gemini con googleSearch
+    grounding + fallback TTS. googleSearch le da acceso a la web, para
+    preguntas tipo 'dame las noticias de IA' o 'qué pasó ayer'."""
     try:
         system_inst = (
             "Sos Iván, asistente de voz en español. SIEMPRE respondés en "
@@ -453,13 +455,19 @@ def exec_query_web(question: str) -> str:
             "conversacional, cercano, natural — como si hablaras a un "
             f"amigo. Hoy es {_today_spanish()}; no inventes fechas. "
             "Máximo 3 frases, 60 palabras. Nada de markdown, asteriscos, "
-            "listas ni emojis: tu respuesta se lee en voz alta."
+            "listas ni emojis: tu respuesta se lee en voz alta. Si la "
+            "pregunta necesita info reciente (noticias, clima, precios, "
+            "eventos), usá la búsqueda web que tenés disponible."
         )
+        # googleSearch grounding = Gemini busca en internet y cita fuentes.
+        # No se puede combinar con thinking_high en la preview actual, así
+        # que priorizamos grounding (más útil para queries factuales).
         data = _gemini_rest(
             model=FALLBACK_MODEL,
             user_text=question,
             system_instruction=system_inst,
-            thinking_high=True,
+            tools=[{"googleSearch": {}}],
+            thinking_high=False,
         )
         answer = ""
         for cand in (data.get("candidates") or []):
