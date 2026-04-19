@@ -272,6 +272,60 @@ def draw_drag_overlay(frame, hand_px: tuple[int, int], zone_label: str, trail_po
                 cv2.FONT_HERSHEY_DUPLEX, 0.8, (120, 220, 255), 2, cv2.LINE_AA)
 
 
+def draw_console(frame, events: list):
+    """Iron Man-style console log: shows the last ~6 system events (hearing,
+    thinking, tool call, result). Each event is (ts, kind, text). Kinds:
+      'hear'  — live transcript    → gray
+      'think' — waiting on Gemini  → amber
+      'tool'  — function call      → cyan
+      'ok'    — action completed   → green
+      'err'   — error              → red
+    Lines fade out after 4s."""
+    if not events:
+        return
+    h, w = frame.shape[:2]
+    now = time.time()
+    recent = [(ts, kind, txt) for (ts, kind, txt) in events if now - ts < 4.5][-6:]
+    if not recent:
+        return
+
+    kind_colors = {
+        "hear":  (180, 180, 180),
+        "think": (80, 200, 255),
+        "tool":  (255, 220, 120),
+        "ok":    (80, 255, 160),
+        "err":   (80, 80, 255),
+    }
+    kind_glyph = {"hear": "› ", "think": "… ", "tool": "» ", "ok": "✓ ", "err": "✗ "}
+
+    panel_w = 430
+    x0 = 22
+    y_top = 340  # sits below the left legend
+    line_h = 22
+
+    # translucent panel background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0 - 10, y_top - 26),
+                  (x0 + panel_w, y_top + len(recent) * line_h + 8),
+                  (12, 14, 22), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+    cv2.rectangle(frame, (x0 - 10, y_top - 26),
+                  (x0 + panel_w, y_top + len(recent) * line_h + 8),
+                  (60, 70, 110), 1)
+    cv2.putText(frame, "CONSOLA", (x0, y_top - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_MUTED, 1, cv2.LINE_AA)
+
+    for i, (ts, kind, txt) in enumerate(recent):
+        age = now - ts
+        alpha = max(0.35, 1.0 - age / 4.5)
+        color = kind_colors.get(kind, COLOR_WHITE)
+        faded = tuple(int(c * alpha) for c in color)
+        prefix = kind_glyph.get(kind, "  ")
+        line = (prefix + txt)[:52]
+        cv2.putText(frame, line, (x0, y_top + i * line_h + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, faded, 1, cv2.LINE_AA)
+
+
 def draw_permission_banner(frame):
     h, w = frame.shape[:2]
     banner = frame.copy()

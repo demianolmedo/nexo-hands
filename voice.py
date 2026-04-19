@@ -866,12 +866,16 @@ class VoiceSystem:
     STATE_THINKING = "thinking"  # Gemini processing the command/query
     STATE_SPEAKING = "speaking"  # TTS audio is playing
 
-    def __init__(self, on_state_change=None, on_transcript=None, on_action=None):
+    def __init__(self, on_state_change=None, on_transcript=None, on_action=None,
+                 on_thinking=None):
         self.model = None
         self.audio_buf = AudioBuffer(seconds=3.0)
         self.on_state_change = on_state_change or (lambda s: None)
         self.on_transcript = on_transcript or (lambda t: None)
         self.on_action = on_action or (lambda a: None)
+        # Optional callback(label) fired when we send a command to Gemini —
+        # used by the HUD to show "pensando..." on the console panel.
+        self.on_thinking = on_thinking or (lambda label: None)
 
         self._awake = False
         self._last_activity = 0.0
@@ -885,6 +889,15 @@ class VoiceSystem:
         # itself via the speaker → mic path and "transcribe" lyrics as commands.
         # We refuse to transcribe during this window.
         self._activation_blackout_until = 0.0
+        # Voice-activity state (end-of-utterance detection). Updated per mic
+        # chunk; the scan loop uses these to wait for a silence gap before
+        # dispatching so "busca las dos primeras frases" stops firing as
+        # three partial tool calls.
+        self._last_vad_ts = 0.0           # last time we saw non-silent audio
+        self._last_utterance_start_ts = 0.0
+        self._last_dispatched_vad_ts = 0.0  # dedupe: don't re-dispatch same utterance
+        self.END_OF_UTTERANCE_GAP = 0.9   # seconds of silence to consider speech done
+        self.VAD_RMS_THRESHOLD = 0.015
 
         if not GEMINI_API_KEY:
             print("[voice] WARNING: GEMINI_API_KEY not set in .env — Gemini disabled")
@@ -912,19 +925,28 @@ class VoiceSystem:
     def _on_chunk(self, chunk: np.ndarray):
         """Called by the shared mic broker for each audio chunk."""
         self.audio_buf.push(chunk)
+        # Fast RMS-based VAD for end-of-utterance detection
+        try:
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+            if rms > self.VAD_RMS_THRESHOLD:
+                now = time.time()
+                # Gap of >2s since last speech = new utterance starts here
+                if now - self._last_vad_ts > 2.0:
+                    self._last_utterance_start_ts = now
+                self._last_vad_ts = now
+        except Exception:
+            pass
         if self._awake and self._live is not None and not self._live.is_fallback():
             self._live.push_audio(chunk)
 
     def _scan_loop(self):
-        """Background thread: transcribe buffer with Whisper to detect wake words.
-        In fallback mode, also dispatch commands via non-Live Gemini."""
-        last_check = 0.0
+        """Background thread: transcribe only after the user has FINISHED
+        speaking (end-of-utterance detected via a silence gap). This prevents
+        partial-sentence tool calls like "busca las dos" → "busca las dos
+        primeras frases"."""
         while self._running:
+            time.sleep(0.15)
             now = time.time()
-            if now - last_check < 1.2:
-                time.sleep(0.1)
-                continue
-            last_check = now
 
             # If Gemini is thinking or we're speaking, don't transcribe — our
             # own TTS would be picked up by the mic and cause an echo loop
@@ -937,17 +959,31 @@ class VoiceSystem:
             # Post-wake blackout while the activation ritual is audible — don't
             # let Whisper transcribe the welcome chime / music as if it were a
             # user command.
-            if time.time() < self._activation_blackout_until:
+            if now < self._activation_blackout_until:
                 self.audio_buf.buf[:] = 0.0
+                continue
+
+            # End-of-utterance detection: only transcribe if user has been
+            # silent for END_OF_UTTERANCE_GAP seconds AND there was voice in
+            # the last ~3s AND we haven't already dispatched this utterance.
+            silence_gap = now - self._last_vad_ts
+            has_speech = self._last_vad_ts > 0
+            if has_speech and silence_gap < self.END_OF_UTTERANCE_GAP:
+                # Still mid-sentence — show LISTEN state, wait
+                if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
+                    self._set_state(self.STATE_LISTEN)
+                continue
+            # No new utterance pending (either no speech yet or we already
+            # dispatched the most recent one)
+            if self._last_vad_ts <= self._last_dispatched_vad_ts:
+                if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
+                    self._set_state(self.STATE_IDLE)
                 continue
 
             audio = self.audio_buf.snapshot()
             is_silent = np.max(np.abs(audio)) < 0.01
-            # Only toggle IDLE/LISTEN based on voice activity; don't stomp on
-            # THINKING/SPEAKING states driven by the dispatch thread.
-            if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
-                self._set_state(self.STATE_IDLE if is_silent else self.STATE_LISTEN)
             if is_silent:
+                self._last_dispatched_vad_ts = self._last_vad_ts
                 continue
 
             try:
@@ -955,6 +991,10 @@ class VoiceSystem:
             except Exception as e:
                 print(f"[voice] transcribe error: {e}")
                 continue
+
+            # Mark this utterance as dispatched so we don't re-process it on
+            # the next scan iteration, regardless of what happens below.
+            self._last_dispatched_vad_ts = self._last_vad_ts
 
             if not text:
                 continue
@@ -999,6 +1039,10 @@ class VoiceSystem:
                         self._set_state(
                             self.STATE_SPEAKING if q else self.STATE_THINKING
                         )
+                        try:
+                            self.on_thinking("pensando…" if not q else "respondiendo…")
+                        except Exception:
+                            pass
                         try:
                             if self._live and self._live.is_fallback():
                                 self._live.send_text_command(t)

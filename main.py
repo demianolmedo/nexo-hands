@@ -23,7 +23,7 @@ import voice as voice_mod
 from hud import (
     draw_status, draw_drag_overlay,
     draw_side_legend, draw_action_log, draw_permission_banner,
-    draw_action_flash, draw_voice_indicator,
+    draw_action_flash, draw_voice_indicator, draw_console,
 )
 
 
@@ -48,6 +48,14 @@ last_action_ts: dict[str, float] = {}
 flash_label: str | None = None
 flash_until = 0.0
 action_log: list[tuple[float, str]] = []  # (ts, label)
+console_events: list[tuple[float, str, str]] = []  # (ts, kind, text)
+
+
+def console_push(kind: str, text: str):
+    """Push an event to the on-screen CONSOLA panel."""
+    console_events.append((time.time(), kind, text[:52]))
+    while len(console_events) > 30:
+        console_events.pop(0)
 
 both_spread_since: float | None = None
 both_fist_since: float | None = None
@@ -92,6 +100,14 @@ HAND_TRAIL_WINDOW_SEC = 0.35
 THROW_SPEED_THRESHOLD = 0.6  # normalized units per second
 
 HAS_ACCESSIBILITY = False
+
+# Gesture warmup: MediaPipe's first few frames after hands enter the view are
+# often misclassified (half-formed hands → "point"/"three" → accidental volume
+# changes). Require a stable 700ms of continuous tracking before any gesture
+# can fire an action. Grab/undo aren't affected since they already require a
+# hold duration.
+GESTURE_WARMUP_SEC = 0.7
+hands_first_seen_ts: float = 0.0
 
 
 def flash(label: str, duration: float = 1.3):
@@ -204,6 +220,7 @@ def main():
     global pointer_aiming_display, pointer_aiming_since, pointer_last_teleport_at, pointer_last_teleport_display
     global last_move, last_gestures_change_ts, last_voice_change_ts, last_activate_ts, hand_trail
     global pending_voice_wake, voice_last_activity_ts
+    global hands_first_seen_ts
 
     cap = None
     for cam_idx in range(4):
@@ -284,7 +301,7 @@ def main():
         global voice_action_label, voice_action_until, pending_voice_wake
         print(f"[voice] wake-word detected → {state}")
         if state == "awake":
-            # "despierta nexo" — but defer if we're mid-grab to not lose the window
+            console_push("ok", "despierta → VOICE ON")
             if grab_active:
                 pending_voice_wake = True
                 voice_action_label = "VOICE PENDIENTE (grab activo)"
@@ -292,12 +309,13 @@ def main():
             else:
                 activate_voice()
         elif state == "sleep":
-            # "descansa nexo" — the voice module already enforces a brief silence
+            console_push("ok", "descansa → VOICE OFF")
             deactivate_voice()
 
     def _on_voice_transcript(text: str):
         global voice_last_transcript
         voice_last_transcript = text[:60]
+        console_push("hear", text[:52])
 
     def _on_voice_action(label: str):
         global voice_action_label, voice_action_until, last_voice_action_ts, voice_last_activity_ts
@@ -305,12 +323,24 @@ def main():
         voice_action_until = time.time() + 1.8
         last_voice_action_ts = time.time()
         voice_last_activity_ts = time.time()
+        # Categorize for colored console
+        low = label.lower()
+        if "error" in low or "blocked" in low:
+            console_push("err", label)
+        elif "query" in low:
+            console_push("ok", label)
+        else:
+            console_push("tool", label)
         print(f"[voice] action: {label}")
+
+    def _on_voice_thinking(label: str):
+        console_push("think", label)
 
     voice_sys = voice_mod.VoiceSystem(
         on_state_change=_on_voice_state,
         on_transcript=_on_voice_transcript,
         on_action=_on_voice_action,
+        on_thinking=_on_voice_thinking,
     )
     try:
         voice_sys.start()
@@ -326,11 +356,31 @@ def main():
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
 
+        # Run MediaPipe on the ORIGINAL (sharp) frame before we blur it —
+        # landmark detection degrades on blurred input.
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = hands.process(rgb)
 
+        # Ambient background blur: gives the Iron Man HUD feel and hides the
+        # messy room behind the user. Kernel 51x51 = pronounced but cheap
+        # (~3-4 ms on 960x540). Landmarks & HUD are drawn sharp on top.
+        frame = cv2.GaussianBlur(frame, (51, 51), 0)
+        # Slight darken so the white HUD text pops
+        frame = cv2.addWeighted(frame, 0.85, frame, 0.0, -12)
+
         left_hand = None
         right_hand = None
+        # Track when hands first enter the view — used to debounce accidental
+        # actions in the first ~700ms of tracking while MediaPipe stabilizes.
+        if result.multi_hand_landmarks:
+            if hands_first_seen_ts == 0.0:
+                hands_first_seen_ts = time.time()
+        else:
+            hands_first_seen_ts = 0.0
+        gestures_warmed_up = (
+            hands_first_seen_ts > 0
+            and time.time() - hands_first_seen_ts >= GESTURE_WARMUP_SEC
+        )
         # Dim landmarks when voice is dominant (gestures paused)
         gestures_paused = voice_active and gestures_enabled
         if result.multi_hand_landmarks:
@@ -578,34 +628,35 @@ def main():
                 if in_grace:
                     # Still draw HUD but skip action dispatch
                     pass
-                # Non-drag gestures (only outside grace window)
-                # pinch single hand → play/pause (avoids conflict with spread=release)
-                if not in_grace and (gesture_l == "pinch" or gesture_r == "pinch"):
+                # Non-drag gestures (only outside grace window AND after warmup)
+                # Warmup prevents MediaPipe's first-frame misclassifications
+                # ("point"/"three"/"pinch") from firing actions.
+                if not in_grace and gestures_warmed_up and (gesture_l == "pinch" or gesture_r == "pinch"):
                     fire_action("play_pause", media.play_pause, "PLAY / PAUSE")
                     refresh_attention()
 
-                if not in_grace and gesture_l == "peace":
+                if not in_grace and gestures_warmed_up and gesture_l == "peace":
                     fire_action("prev", media.previous_track, "PREV TRACK")
                     refresh_attention()
-                if not in_grace and gesture_r == "peace":
+                if not in_grace and gestures_warmed_up and gesture_r == "peace":
                     fire_action("next", media.next_track, "NEXT TRACK")
                     refresh_attention()
 
-                # Only fire desktop switch with single-hand rock (two-hand rock = undo)
-                if not in_grace and gesture_l == "rock" and not both_rock:
-                    fire_action("desk_left", media.desktop_left, "DESKTOP LEFT")
-                    refresh_attention()
-                if not in_grace and gesture_r == "rock" and not both_rock:
-                    fire_action("desk_right", media.desktop_right, "DESKTOP RIGHT")
-                    refresh_attention()
+                # Desktop switch (single-hand rock) DISABLED — caused confusion
+                # with the two-hand-rock UNDO gesture. Re-enable by un-commenting
+                # this block if desired.
+                # if not in_grace and gesture_l == "rock" and not both_rock:
+                #     fire_action("desk_left", media.desktop_left, "DESKTOP LEFT")
+                # if not in_grace and gesture_r == "rock" and not both_rock:
+                #     fire_action("desk_right", media.desktop_right, "DESKTOP RIGHT")
 
                 now = time.time()
-                if not in_grace and (gesture_l == "three" or gesture_r == "three"):
+                if not in_grace and gestures_warmed_up and (gesture_l == "three" or gesture_r == "three"):
                     if now - last_action_ts.get("vol_up", 0) >= 0.12:
                         media.volume_up(step=2)
                         last_action_ts["vol_up"] = now
                         refresh_attention()
-                if not in_grace and (gesture_l == "point" or gesture_r == "point"):
+                if not in_grace and gestures_warmed_up and (gesture_l == "point" or gesture_r == "point"):
                     if now - last_action_ts.get("vol_down", 0) >= 0.12:
                         media.volume_down(step=2)
                         last_action_ts["vol_down"] = now
@@ -636,6 +687,8 @@ def main():
 
         # Action log (right side, below legend)
         draw_action_log(frame, action_log)
+        # Console panel (left side) — live transcript + thinking + tool calls
+        draw_console(frame, console_events)
 
         # Drag overlay
         if grab_active:
