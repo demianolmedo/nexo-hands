@@ -376,10 +376,11 @@ def main():
         mask = cv2.GaussianBlur(mask, (15, 15), 0)
         mask = _np.clip(mask, 0.0, 1.0)
         mask3 = _np.repeat(mask[:, :, None], 3, axis=2)
-        # Heavy blur for background. Kernel must be odd; 81 ≈ "98% frosted"
-        bg = cv2.GaussianBlur(frame, (81, 81), 0)
-        # Darken the blurred bg so the HUD text and user pop even more
-        bg = cv2.addWeighted(bg, 0.72, bg, 0.0, -30)
+        # Heavy blur for background. Kernel 151 = máximo práctico (vidrio
+        # esmerilado extremo). Cuesta ~12ms por frame en 960x540.
+        bg = cv2.GaussianBlur(frame, (151, 151), 0)
+        # Darken heavily so user pops (negro casi vidrio oscuro)
+        bg = cv2.addWeighted(bg, 0.55, bg, 0.0, -50)
         # Composite: sharp person over blurred-dark bg
         frame = (frame.astype(_np.float32) * mask3 +
                  bg.astype(_np.float32) * (1.0 - mask3)).astype(_np.uint8)
@@ -647,17 +648,16 @@ def main():
                 # Non-drag gestures (only outside grace window AND after warmup)
                 # Warmup prevents MediaPipe's first-frame misclassifications
                 # ("point"/"three"/"pinch") from firing actions.
-                # PLAY / PAUSE = both-hand peace (V) juntos. Unambiguo y
-                # distinto a single-hand peace (prev/next).
-                both_peace = (gesture_l == "peace" and gesture_r == "peace")
-                if not in_grace and gestures_warmed_up and both_peace:
+                # PLAY / PAUSE = CUATRO dedos mano derecha (index+middle+ring+
+                # pinky arriba, pulgar abajo). Gesto nuevo 'four'.
+                if not in_grace and gestures_warmed_up and (gesture_l == "four" or gesture_r == "four"):
                     fire_action("play_pause", media.play_pause, "PLAY / PAUSE")
                     refresh_attention()
-                # PREV / NEXT: peace SOLO con una mano (la otra no puede ser peace).
-                if not in_grace and gestures_warmed_up and gesture_l == "peace" and not both_peace:
+
+                if not in_grace and gestures_warmed_up and gesture_l == "peace":
                     fire_action("prev", media.previous_track, "PREV TRACK")
                     refresh_attention()
-                if not in_grace and gestures_warmed_up and gesture_r == "peace" and not both_peace:
+                if not in_grace and gestures_warmed_up and gesture_r == "peace":
                     fire_action("next", media.next_track, "NEXT TRACK")
                     refresh_attention()
 

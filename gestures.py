@@ -25,6 +25,9 @@ def detect_gesture(landmarks) -> str | None:
     if index_up and pinky_up and not middle_up and not ring_up:
         return 'rock'
 
+    if index_up and middle_up and ring_up and pinky_up and not thumb_up:
+        return 'four'
+
     if index_up and middle_up and ring_up and not pinky_up:
         return 'three'
 

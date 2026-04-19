@@ -896,8 +896,15 @@ class VoiceSystem:
         self._last_vad_ts = 0.0           # last time we saw non-silent audio
         self._last_utterance_start_ts = 0.0
         self._last_dispatched_vad_ts = 0.0  # dedupe: don't re-dispatch same utterance
-        self.END_OF_UTTERANCE_GAP = 0.9   # seconds of silence to consider speech done
-        self.VAD_RMS_THRESHOLD = 0.015
+        self._last_dispatched_wall_ts = 0.0  # wall-clock of last dispatch (force-fallback)
+        self.END_OF_UTTERANCE_GAP = 0.8   # seconds of silence to consider speech done
+        # Umbral RMS bajo: el mic del usuario es suave. Con 0.015 el VAD no
+        # enganchaba y el awake-mode se quedaba colgado en "listen".
+        self.VAD_RMS_THRESHOLD = 0.006
+        # Si hay audio no-silencioso en buffer y han pasado > FORCE_TRANSCRIBE_SEC
+        # desde el último dispatch, transcribimos aunque el VAD no haya visto
+        # un gap claro de silencio (maneja ruido ambiente continuo).
+        self.FORCE_TRANSCRIBE_SEC = 3.5
 
         if not GEMINI_API_KEY:
             print("[voice] WARNING: GEMINI_API_KEY not set in .env — Gemini disabled")
@@ -973,19 +980,32 @@ class VoiceSystem:
                 if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
                     self._set_state(self.STATE_LISTEN)
             else:
-                # --- Awake mode: end-of-utterance gating ---
+                # --- Awake mode: end-of-utterance gating with fallback ---
                 silence_gap = now - self._last_vad_ts
                 has_speech = self._last_vad_ts > 0
-                if has_speech and silence_gap < self.END_OF_UTTERANCE_GAP:
+                # Normal path: user stopped talking for END_OF_UTTERANCE_GAP
+                gap_ok = has_speech and silence_gap >= self.END_OF_UTTERANCE_GAP
+                # Fallback: buffer has non-trivial audio but we haven't
+                # dispatched in a while (noisy room, VAD never resets)
+                audio_peek = self.audio_buf.snapshot()
+                has_buffer_audio = np.max(np.abs(audio_peek)) > 0.012
+                forced = (
+                    has_buffer_audio
+                    and now - self._last_dispatched_wall_ts >= self.FORCE_TRANSCRIBE_SEC
+                )
+                if not (gap_ok or forced):
                     if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
-                        self._set_state(self.STATE_LISTEN)
+                        self._set_state(
+                            self.STATE_LISTEN if has_speech or has_buffer_audio
+                            else self.STATE_IDLE
+                        )
                     continue
-                if self._last_vad_ts <= self._last_dispatched_vad_ts:
+                if gap_ok and self._last_vad_ts <= self._last_dispatched_vad_ts:
                     if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
                         self._set_state(self.STATE_IDLE)
                     continue
-                audio = self.audio_buf.snapshot()
-                if np.max(np.abs(audio)) < 0.01:
+                audio = audio_peek
+                if np.max(np.abs(audio)) < 0.008:
                     self._last_dispatched_vad_ts = self._last_vad_ts
                     continue
 
@@ -998,6 +1018,7 @@ class VoiceSystem:
             # Mark this utterance as dispatched so we don't re-process it on
             # the next scan iteration, regardless of what happens below.
             self._last_dispatched_vad_ts = self._last_vad_ts
+            self._last_dispatched_wall_ts = time.time()
 
             if not text:
                 continue
