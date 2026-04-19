@@ -138,35 +138,93 @@ def _focus_pid(pid: int):
         pass
 
 
-# Voz por defecto: Reed en español mexicano (masculina, neutra latinoamericana).
-# Override con `TTS_VOICE=Jorge` en .env si bajás la voz premium desde
-# System Settings > Accessibility > Spoken Content > Voices > Manage Voices.
-# Voces premium recomendadas para estilo JARVIS en español: Jorge (es_ES,
-# Enhanced/Premium), Juan (es_MX, Enhanced), Diego (es_AR). Son descarga de
-# Apple, una vez instaladas `say -v Jorge "..."` las usa directamente.
-TTS_VOICE = os.environ.get("TTS_VOICE", "Reed (es_MX)")
-# `say` acepta el nombre tal cual aparece en `say -v '?'`; la variante entre
-# paréntesis es el locale para distinguir el mismo nombre en distintos idiomas.
-TTS_RATE = int(os.environ.get("TTS_RATE", "185"))  # 175-200 suena conversacional
+# TTS provider: "gemini" (Gemini 3.1 Flash TTS Preview via REST, JARVIS-grade)
+# or "mac" (macOS `say`, offline). Gemini fails back to mac on any error.
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "gemini").lower()
+# Gemini voices (prebuilt): Orus, Charon, Fenrir = deep male.
+# Zephyr, Puck, Algieba, Enceladus = other male options. Full list in docs.
+TTS_MODEL_GEMINI = os.environ.get("TTS_MODEL_GEMINI", "gemini-3.1-flash-tts-preview")
+TTS_VOICE_GEMINI = os.environ.get("TTS_VOICE_GEMINI", "Orus")
+# macOS `say` fallback config
+TTS_VOICE_MAC = os.environ.get("TTS_VOICE_MAC", "Reed (es_MX)")
+TTS_RATE_MAC = int(os.environ.get("TTS_RATE_MAC", "185"))  # 175-200 conversacional
+# Legacy alias so old callers keep working
+TTS_VOICE = TTS_VOICE_MAC
+TTS_RATE = TTS_RATE_MAC
+
+
+def _kill_audio_output():
+    """Kill any leftover say/afplay so the new utterance doesn't overlap."""
+    for pat in (r"^say\b", "afplay"):
+        try:
+            subprocess.run(["pkill", "-f", pat], capture_output=True, timeout=1)
+        except Exception:
+            pass
+
+
+def _speak_gemini(text: str) -> bool:
+    """Gemini TTS via REST → WAV → afplay. Blocks until playback ends.
+    Returns True on success, False on failure (caller falls back to `say`)."""
+    import base64
+    import tempfile
+    import wave
+    if not GEMINI_API_KEY:
+        return False
+    try:
+        url = f"{_GEMINI_HOST}/models/{TTS_MODEL_GEMINI}:generateContent?key={GEMINI_API_KEY}"
+        body = {
+            "contents": [{"parts": [{"text": text[:800]}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {"voiceName": TTS_VOICE_GEMINI}
+                    }
+                },
+            },
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        pcm = b""
+        for cand in data.get("candidates", []):
+            for part in cand.get("content", {}).get("parts", []):
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline and inline.get("data"):
+                    pcm += base64.b64decode(inline["data"])
+        if not pcm:
+            return False
+        _kill_audio_output()
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            path = tf.name
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)       # 16-bit
+            wf.setframerate(24000)   # Gemini TTS outputs 24 kHz PCM
+            wf.writeframes(pcm)
+        subprocess.run(
+            ["afplay", path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+        return True
+    except Exception as e:
+        print(f"[tts-gemini] fallback to say: {e}")
+        return False
 
 
 def _speak_mac(text: str, voice: str | None = None, rate: int | None = None):
-    """Speak `text` and BLOCK until done. Blocking is on purpose: the caller
-    (exec_query_web) runs inside the dispatch thread, and we want the
-    STATE_SPEAKING flag to stay set until audio actually ends — otherwise the
-    scan loop wakes up mid-utterance, picks up our own voice via the mic, and
-    echoes back another Gemini call. Also kills any previous `say` / `afplay`
-    (activation music, prior reply) so nothing overlaps."""
-    try:
-        subprocess.run(["pkill", "-f", r"^say\b"], capture_output=True, timeout=1)
-    except Exception:
-        pass
-    try:
-        subprocess.run(["pkill", "-f", "afplay"], capture_output=True, timeout=1)
-    except Exception:
-        pass
-    voice = voice or TTS_VOICE
-    rate = rate or TTS_RATE
+    """macOS `say` fallback. Blocks until playback ends so the dispatch-thread
+    STATE_SPEAKING flag stays set (prevents the scan loop from picking up
+    our own voice via the mic and echoing another Gemini call)."""
+    _kill_audio_output()
+    voice = voice or TTS_VOICE_MAC
+    rate = rate or TTS_RATE_MAC
     try:
         subprocess.run(
             ["say", "-v", voice, "-r", str(rate), text[:500]],
@@ -175,6 +233,13 @@ def _speak_mac(text: str, voice: str | None = None, rate: int | None = None):
         )
     except Exception:
         pass
+
+
+def _speak(text: str):
+    """Main entry point: route to provider, fall back on failure."""
+    if TTS_PROVIDER == "gemini" and _speak_gemini(text):
+        return
+    _speak_mac(text)
 
 
 def exec_open_url(url: str) -> str:
@@ -326,7 +391,7 @@ def exec_query_web(question: str) -> str:
                     answer = (answer + " " + txt).strip()
         if not answer:
             return "QUERY (no response)"
-        _speak_mac(answer)
+        _speak(answer)
         return f"QUERY: {answer[:60]}..."
     except Exception as e:
         exec_search_google(question)
