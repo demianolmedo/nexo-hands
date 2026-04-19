@@ -37,9 +37,9 @@ load_dotenv(_HERE / ".env")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 SAMPLE_RATE = 16000
-# Models verified available with the user's key (Apr 2026):
-LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
-FALLBACK_MODEL = "gemini-flash-latest"
+# Gemini 3.1 Flash — newest generation available (verified via API Apr 2026)
+LIVE_MODEL = "gemini-3.1-flash-live-preview"          # WebSocket Live API, bidi audio
+FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"      # standard generate_content path
 
 # Wake words use "ivan" (user's preference over "nexo"). Whisper tiny often
 # mistranscribes names; we fuzzy-match a wake verb stem + a name variant.
