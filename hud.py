@@ -151,11 +151,11 @@ def draw_side_legend(frame, side: str):
             (None, "spread 2m 1s", "ON"),
             (None, "fist 2m", "OFF"),
             ("MEDIA", None, None),
-            (None, "4 dedos", "play/pause"),
+            (None, "3 dedos R", "play/pause"),
             (None, "peace L", "previous"),
             (None, "peace R", "next"),
             ("VOLUMEN", None, None),
-            (None, "3 dedos", "vol +"),
+            (None, "3 dedos L", "vol +"),
             (None, "point (1)", "vol -"),
         ]
     else:

@@ -647,10 +647,10 @@ def main():
                     pass
                 # Non-drag gestures (only outside grace window AND after warmup)
                 # Warmup prevents MediaPipe's first-frame misclassifications
-                # ("point"/"three"/"pinch") from firing actions.
-                # PLAY / PAUSE = CUATRO dedos mano derecha (index+middle+ring+
-                # pinky arriba, pulgar abajo). Gesto nuevo 'four'.
-                if not in_grace and gestures_warmed_up and (gesture_l == "four" or gesture_r == "four"):
+                # ("point"/"three") from firing actions.
+                # PLAY / PAUSE = 3 dedos MANO DERECHA (three: index+middle+
+                # ring arriba, pinky y pulgar abajo). Solo derecha.
+                if not in_grace and gestures_warmed_up and gesture_r == "three":
                     fire_action("play_pause", media.play_pause, "PLAY / PAUSE")
                     refresh_attention()
 
@@ -670,7 +670,8 @@ def main():
                 #     fire_action("desk_right", media.desktop_right, "DESKTOP RIGHT")
 
                 now = time.time()
-                if not in_grace and gestures_warmed_up and (gesture_l == "three" or gesture_r == "three"):
+                # Vol UP solo con mano IZQUIERDA — right three = play/pause.
+                if not in_grace and gestures_warmed_up and gesture_l == "three":
                     if now - last_action_ts.get("vol_up", 0) >= 0.12:
                         media.volume_up(step=2)
                         last_action_ts["vol_up"] = now

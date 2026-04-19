@@ -146,7 +146,9 @@ TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "gemini").lower()
 TTS_MODEL_GEMINI = os.environ.get("TTS_MODEL_GEMINI", "gemini-3.1-flash-tts-preview")
 TTS_VOICE_GEMINI = os.environ.get("TTS_VOICE_GEMINI", "Orus")
 # macOS `say` fallback config
-TTS_VOICE_MAC = os.environ.get("TTS_VOICE_MAC", "Reed (es_MX)")
+# Paulina: único es_MX con ese nombre → say no se confunde con variantes
+# inglesas cuando el parser del nombre ignora el paréntesis.
+TTS_VOICE_MAC = os.environ.get("TTS_VOICE_MAC", "Paulina")
 TTS_RATE_MAC = int(os.environ.get("TTS_RATE_MAC", "185"))  # 175-200 conversacional
 # Legacy alias so old callers keep working
 TTS_VOICE = TTS_VOICE_MAC
@@ -207,12 +209,15 @@ def _speak_gemini(text: str) -> bool:
             wf.setsampwidth(2)       # 16-bit
             wf.setframerate(24000)   # Gemini TTS outputs 24 kHz PCM
             wf.writeframes(pcm)
-        subprocess.run(
+        result = subprocess.run(
             ["afplay", path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=30,
         )
-        return True
+        # Si afplay devuelve != 0, el audio no se escuchó. Devolvemos False
+        # para que el caller decida si quiere fallback a `say`. Antes
+        # devolvíamos True siempre y se perdía la respuesta en silencio.
+        return result.returncode == 0
     except Exception as e:
         print(f"[tts-gemini] fallback to say: {e}")
         return False
@@ -332,6 +337,63 @@ def exec_paste() -> str:
 # ------------- GEMINI REST CLIENT (no SDK, no semaphore leaks) -------------
 
 _GEMINI_HOST = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def _audio_to_wav_bytes(audio: np.ndarray, sr: int = SAMPLE_RATE) -> bytes:
+    """Convert float32 audio [-1,1] to 16-bit PCM WAV bytes (in-memory)."""
+    import io
+    import wave as _wave
+    pcm16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with _wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm16.tobytes())
+    return buf.getvalue()
+
+
+def _gemini_rest_audio(model: str, audio: np.ndarray, system_instruction: str,
+                       tools: list | None = None, timeout: float = 25.0) -> dict:
+    """Send raw audio + tools to Gemini in one shot. Gemini transcribes
+    internally (mejor precisión que Whisper tiny) y devuelve directamente
+    el functionCall. Reemplaza Whisper + send_text_command en el flujo
+    de comandos (wake-word sigue en Whisper local)."""
+    import base64
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    url = f"{_GEMINI_HOST}/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    wav_bytes = _audio_to_wav_bytes(audio)
+    body: dict = {
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{
+            "role": "user",
+            "parts": [{
+                "inlineData": {
+                    "mimeType": "audio/wav",
+                    "data": base64.b64encode(wav_bytes).decode("ascii"),
+                }
+            }]
+        }],
+    }
+    if tools:
+        body["tools"] = tools
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8")[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"gemini {e.code}: {detail}") from None
 
 
 def _gemini_rest(model: str, user_text: str, system_instruction: str,
@@ -801,6 +863,59 @@ class GeminiLiveSession:
     # Defensive rate limit so transient Gemini errors don't hammer the HUD
     _last_err_flash_at: float = 0.0
 
+    def send_audio_command(self, audio: np.ndarray, on_transcript=None):
+        """Route raw audio to Gemini via REST (audio input + tools in one shot).
+        Gemini transcribes internamente — mejor precisión que Whisper tiny —
+        y decide qué tool llamar. Reemplaza el pipeline
+        Whisper→text→send_text_command para comandos (el wake-word sigue
+        en Whisper local por costo)."""
+        if not self.api_key:
+            return
+        try:
+            data = _gemini_rest_audio(
+                model=FALLBACK_MODEL,
+                audio=audio,
+                system_instruction=(
+                    "Sos Iván, asistente de voz para macOS, hablás ESPAÑOL "
+                    f"neutro latinoamericano. Hoy es {_today_spanish()}. "
+                    "Escuchá el audio y llamá la función correspondiente con "
+                    "los parámetros correctos. Ejemplos: 'abre youtube' → "
+                    "open_url(url='youtube.com'); 'reproduce el video' → "
+                    "play_pause(); 'busca tal cosa' → search_google; "
+                    "preguntas conversacionales (dime, explícame, qué, cuál) "
+                    "→ query_web con la pregunta completa. "
+                    "Solo press_enter=True si el usuario dice 'y envía' o "
+                    "'y ejecuta'. Si no hay función clara, no llames nada."
+                ),
+                tools=TOOLS,
+            )
+            # Some models include input_transcription in the response meta;
+            # we surface it to the HUD if present.
+            for cand in (data.get("candidates") or []):
+                for part in (cand.get("content", {}).get("parts") or []):
+                    if "text" in part and on_transcript:
+                        try:
+                            on_transcript(part["text"][:60])
+                        except Exception:
+                            pass
+                    fc = part.get("functionCall")
+                    if fc and fc.get("name"):
+                        fn = FN_DISPATCH.get(fc["name"])
+                        if fn:
+                            try:
+                                result = fn(**(fc.get("args") or {}))
+                                self.on_action(result + " (audio)")
+                                return
+                            except Exception as e:
+                                self.on_action(f"ERROR {fc['name']}: {e}")
+                                return
+        except Exception as e:
+            import time as _t
+            now = _t.time()
+            if now - self._last_err_flash_at > 5.0:
+                self._last_err_flash_at = now
+                self.on_action(f"GEMINI AUDIO ERR: {str(e)[:80]}")
+
     def send_text_command(self, text: str):
         """Route `text` to Gemini via REST, dispatch the returned function call.
         REST (not SDK) avoids the semaphore-leak SIGTRAP."""
@@ -1049,32 +1164,26 @@ class VoiceSystem:
                 if regex_hit is not None:
                     self.on_action(regex_hit[1] + " (local)")
                     continue
-                # Route to Gemini in a background thread so the scan_loop keeps
-                # capturing audio and new commands aren't blocked while Gemini
-                # thinks / TTS plays. Clear the audio buffer so the same
-                # transcription doesn't get re-processed on the next scan.
+                # Dispatch raw AUDIO (not the Whisper text) to Gemini — mejor
+                # precisión. Whisper ya se usó arriba solo para detectar el
+                # close-verb y surfacear una transcripción rápida en el HUD.
                 if self._live is not None:
-                    is_query = _is_query(text)
-                    self._live.set_expect_audio_reply(is_query)
-                    # Clear recent audio so the same phrase doesn't fire twice
+                    audio_copy = audio.copy()
                     self.audio_buf.buf[:] = 0.0
 
-                    def _dispatch(t=text, q=is_query):
-                        self._set_state(
-                            self.STATE_SPEAKING if q else self.STATE_THINKING
-                        )
+                    def _dispatch(a=audio_copy):
+                        self._set_state(self.STATE_THINKING)
                         try:
-                            self.on_thinking("pensando…" if not q else "respondiendo…")
+                            self.on_thinking("pensando…")
                         except Exception:
                             pass
                         try:
-                            if self._live and self._live.is_fallback():
-                                self._live.send_text_command(t)
+                            self._live.send_audio_command(
+                                a, on_transcript=self.on_transcript
+                            )
                         except Exception as e:
                             print(f"[voice] dispatch error: {e}")
                         finally:
-                            # Drain any echo we captured of ourselves while
-                            # Gemini/say were running before reopening the mic.
                             try:
                                 self.audio_buf.buf[:] = 0.0
                             except Exception:
