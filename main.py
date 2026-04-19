@@ -2,6 +2,10 @@
 import sys
 import time
 import threading
+# Install faulthandler so any native crash (SIGTRAP/SIGSEGV/SIGABRT) prints
+# a Python stack instead of just leaving `zsh: trace trap` in the terminal.
+import faulthandler
+faulthandler.enable()
 import cv2
 import mediapipe as mp
 

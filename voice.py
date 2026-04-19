@@ -21,13 +21,19 @@ import threading
 import subprocess
 from pathlib import Path
 
+import json
+import urllib.request
+import urllib.error
+
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from dotenv import load_dotenv
 
-from google import genai
-from google.genai import types as genai_types
+# google-genai SDK is intentionally NOT imported at runtime: the preview build
+# leaks multiprocessing semaphores on every call, which eventually trips SIGTRAP
+# ("trace trap" + "resource_tracker: leaked semaphore"). We hit Gemini via plain
+# REST calls in `_gemini_rest()` below — stdlib urllib, zero multiprocessing.
 
 
 # ----------------- CONFIG (no secrets in code) -----------------
@@ -226,63 +232,46 @@ def exec_paste() -> str:
     return "PASTE"
 
 
-TTS_MODEL = "gemini-3.1-flash-tts-preview"
-TTS_VOICE = "Kore"  # natural Spanish-capable voice
+# ------------- GEMINI REST CLIENT (no SDK, no semaphore leaks) -------------
+
+_GEMINI_HOST = "https://generativelanguage.googleapis.com/v1beta"
 
 
-def _speak_with_gemini_tts(text: str) -> bool:
-    """Generate audio from `text` via Gemini TTS Preview and play it with afplay.
-    Returns True on success, False on failure (caller can fall back to `say`)."""
+def _gemini_rest(model: str, user_text: str, system_instruction: str,
+                 tools: list | None = None, thinking_high: bool = False,
+                 timeout: float = 20.0) -> dict:
+    """Plain HTTPS POST to the Gemini REST API. Returns parsed JSON.
+
+    We use urllib from stdlib so there is zero multiprocessing involvement.
+    The google-genai preview SDK leaks semaphores and has been the source of
+    every SIGTRAP crash we've seen — this bypasses it completely."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    url = f"{_GEMINI_HOST}/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    body: dict = {
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+    }
+    if tools:
+        body["tools"] = tools
+    if thinking_high:
+        body["generationConfig"] = {"thinkingConfig": {"thinkingLevel": "high"}}
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model=TTS_MODEL,
-            contents=text,
-            config=genai_types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=genai_types.SpeechConfig(
-                    voice_config=genai_types.VoiceConfig(
-                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
-                            voice_name=TTS_VOICE
-                        )
-                    )
-                ),
-            ),
-        )
-        pcm = b""
-        for cand in response.candidates or []:
-            for part in cand.content.parts or []:
-                inline = getattr(part, "inline_data", None)
-                if inline and getattr(inline, "data", None):
-                    pcm += bytes(inline.data)
-        if not pcm:
-            return False
-        import tempfile, wave
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-            path = tf.name
-        with wave.open(path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(24000)
-            wf.writeframes(pcm)
-        subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except Exception as e:
-        print(f"[tts] gemini tts failed: {e}")
-        return False
-
-
-# Singleton Gemini client — creating a new one for every call leaks
-# multiprocessing semaphores in the preview SDK which eventually crash the
-# process with SIGTRAP ("resource_tracker: leaked semaphore objects").
-_genai_client: "genai.Client | None" = None
-
-
-def _get_client():
-    global _genai_client
-    if _genai_client is None:
-        _genai_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _genai_client
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8")[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"gemini {e.code}: {detail}") from None
 
 
 def _today_spanish() -> str:
@@ -295,31 +284,27 @@ def _today_spanish() -> str:
 
 
 def exec_query_web(question: str) -> str:
-    """Answer a query with thinking_level=high (per docs, improves reasoning
-    on conversational questions) and read the result via macOS `say`."""
+    """Answer a conversational query via REST Gemini + macOS `say`. Uses
+    thinking_level=high for better reasoning on nuanced questions."""
     try:
-        client = _get_client()
         system_inst = (
             f"Hoy es {_today_spanish()}. Respondé en español, breve "
             f"(máximo 3 frases, 60 palabras). No inventes fechas: usá la de "
             f"hoy si el usuario pregunta qué día es. No uses markdown, ni "
             f"asteriscos, ni listas — la respuesta se lee en voz alta."
         )
-        cfg = genai_types.GenerateContentConfig(
-            system_instruction=system_inst,
-            # Thinking mode for nuanced answers; supported by 3.1-flash-lite-preview
-            thinking_config=genai_types.ThinkingConfig(thinking_level="high"),
-        )
-        response = client.models.generate_content(
+        data = _gemini_rest(
             model=FALLBACK_MODEL,
-            contents=question,
-            config=cfg,
+            user_text=question,
+            system_instruction=system_inst,
+            thinking_high=True,
         )
         answer = ""
-        for cand in (response.candidates or []):
-            for part in (cand.content.parts or []):
-                if getattr(part, "text", None):
-                    answer = (answer + " " + part.text).strip()
+        for cand in (data.get("candidates") or []):
+            for part in (cand.get("content", {}).get("parts") or []):
+                txt = part.get("text")
+                if txt:
+                    answer = (answer + " " + txt).strip()
         if not answer:
             return "QUERY (no response)"
         _speak_mac(answer)
@@ -717,36 +702,35 @@ class GeminiLiveSession:
     _last_err_flash_at: float = 0.0
 
     def send_text_command(self, text: str):
-        """Fallback: non-Live Gemini with tools. Skip if model unavailable."""
+        """Route `text` to Gemini via REST, dispatch the returned function call.
+        REST (not SDK) avoids the semaphore-leak SIGTRAP."""
         if not self.api_key:
             return
         try:
-            client = _get_client()
-            response = client.models.generate_content(
+            data = _gemini_rest(
                 model=FALLBACK_MODEL,
-                contents=text,
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=(
-                        f"Eres Ivan, asistente de voz para macOS. Hoy es {_today_spanish()}. "
-                        "Identificá qué función ejecutar según la voz del usuario y llamala. "
-                        "Solo press_enter=True si el usuario dice 'y envía' o 'y ejecuta'. "
-                        "Si no hay función clara, no llames nada (no narres ni respondas)."
-                    ),
-                    tools=TOOLS,
+                user_text=text,
+                system_instruction=(
+                    f"Eres Ivan, asistente de voz para macOS. Hoy es {_today_spanish()}. "
+                    "Identificá qué función ejecutar según la voz del usuario y llamala. "
+                    "Solo press_enter=True si el usuario dice 'y envía' o 'y ejecuta'. "
+                    "Si no hay función clara, no llames nada (no narres ni respondas)."
                 ),
+                tools=TOOLS,
             )
-            for cand in (response.candidates or []):
-                for part in (cand.content.parts or []):
-                    fc = getattr(part, "function_call", None)
-                    if fc and fc.name:
-                        fn = FN_DISPATCH.get(fc.name)
+            for cand in (data.get("candidates") or []):
+                for part in (cand.get("content", {}).get("parts") or []):
+                    # REST uses camelCase: functionCall with {name, args}
+                    fc = part.get("functionCall")
+                    if fc and fc.get("name"):
+                        fn = FN_DISPATCH.get(fc["name"])
                         if fn:
                             try:
-                                result = fn(**dict(fc.args or {}))
+                                result = fn(**(fc.get("args") or {}))
                                 self.on_action(result + " (fallback)")
                                 return
                             except Exception as e:
-                                self.on_action(f"ERROR {fc.name}: {e}")
+                                self.on_action(f"ERROR {fc['name']}: {e}")
                                 return
         except Exception as e:
             import time as _t
@@ -791,6 +775,10 @@ class VoiceSystem:
         self._live: GeminiLiveSession | None = None
         self._processing_state = self.STATE_IDLE
         self._state_lock = threading.Lock()
+        # While the welcome/activation music plays, Whisper can hear the song
+        # itself via the speaker → mic path and "transcribe" lyrics as commands.
+        # We refuse to transcribe during this window.
+        self._activation_blackout_until = 0.0
 
         if not GEMINI_API_KEY:
             print("[voice] WARNING: GEMINI_API_KEY not set in .env — Gemini disabled")
@@ -838,6 +826,13 @@ class VoiceSystem:
             cur_state = self.get_processing_state()
             if cur_state in (self.STATE_THINKING, self.STATE_SPEAKING):
                 self.audio_buf.buf[:] = 0.0  # drop whatever we captured of ourselves
+                continue
+
+            # Post-wake blackout while the activation ritual is audible — don't
+            # let Whisper transcribe the welcome chime / music as if it were a
+            # user command.
+            if time.time() < self._activation_blackout_until:
+                self.audio_buf.buf[:] = 0.0
                 continue
 
             audio = self.audio_buf.snapshot()
@@ -920,6 +915,9 @@ class VoiceSystem:
         self._awake = True
         self._last_activity = time.time()
         self._last_command_at = time.time()
+        # Welcome (~2s) + activation music (15s) = ignore mic for ~17s so
+        # Whisper doesn't transcribe the music.
+        self._activation_blackout_until = time.time() + 17.0
         # NOTE: We bypass the Live WebSocket for now. The google-genai preview
         # SDK crashes with SIGTRAP when `gemini-3.1-flash-live-preview` returns
         # its first audio response on this stack, and that's been reproduced
