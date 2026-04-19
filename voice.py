@@ -62,8 +62,10 @@ CLOSE_VERBS = (
 
 # ----------------- FUNCTION DECLARATIONS -----------------
 
+# REST-style camelCase keys: `functionDeclarations`, `parametersJsonSchema`.
+# The google-genai SDK auto-converted snake_case, but we're going REST now.
 TOOLS = [{
-    "function_declarations": [
+    "functionDeclarations": [
         {"name": "open_url", "description": "Abre una URL en el navegador por defecto",
          "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
         {"name": "open_app", "description": "Abre una aplicación de macOS por su nombre (ej Spotify, Chrome, Notion)",
@@ -136,7 +138,19 @@ def _focus_pid(pid: int):
         pass
 
 
-def _speak_mac(text: str, voice: str = "Monica"):
+# Voz por defecto: Reed en español mexicano (masculina, neutra latinoamericana).
+# Override con `TTS_VOICE=Jorge` en .env si bajás la voz premium desde
+# System Settings > Accessibility > Spoken Content > Voices > Manage Voices.
+# Voces premium recomendadas para estilo JARVIS en español: Jorge (es_ES,
+# Enhanced/Premium), Juan (es_MX, Enhanced), Diego (es_AR). Son descarga de
+# Apple, una vez instaladas `say -v Jorge "..."` las usa directamente.
+TTS_VOICE = os.environ.get("TTS_VOICE", "Reed (es_MX)")
+# `say` acepta el nombre tal cual aparece en `say -v '?'`; la variante entre
+# paréntesis es el locale para distinguir el mismo nombre en distintos idiomas.
+TTS_RATE = int(os.environ.get("TTS_RATE", "185"))  # 175-200 suena conversacional
+
+
+def _speak_mac(text: str, voice: str | None = None, rate: int | None = None):
     """Speak `text` and BLOCK until done. Blocking is on purpose: the caller
     (exec_query_web) runs inside the dispatch thread, and we want the
     STATE_SPEAKING flag to stay set until audio actually ends — otherwise the
@@ -151,9 +165,11 @@ def _speak_mac(text: str, voice: str = "Monica"):
         subprocess.run(["pkill", "-f", "afplay"], capture_output=True, timeout=1)
     except Exception:
         pass
+    voice = voice or TTS_VOICE
+    rate = rate or TTS_RATE
     try:
         subprocess.run(
-            ["say", "-v", voice, text[:500]],
+            ["say", "-v", voice, "-r", str(rate), text[:500]],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=30,
         )
@@ -288,10 +304,13 @@ def exec_query_web(question: str) -> str:
     thinking_level=high for better reasoning on nuanced questions."""
     try:
         system_inst = (
-            f"Hoy es {_today_spanish()}. Respondé en español, breve "
-            f"(máximo 3 frases, 60 palabras). No inventes fechas: usá la de "
-            f"hoy si el usuario pregunta qué día es. No uses markdown, ni "
-            f"asteriscos, ni listas — la respuesta se lee en voz alta."
+            "Sos Iván, asistente de voz en español. SIEMPRE respondés en "
+            "ESPAÑOL NEUTRO LATINOAMERICANO, jamás en inglés ni en español "
+            "de España (no uses 'vosotros', 'tío', 'ordenador'). Tono "
+            "conversacional, cercano, natural — como si hablaras a un "
+            f"amigo. Hoy es {_today_spanish()}; no inventes fechas. "
+            "Máximo 3 frases, 60 palabras. Nada de markdown, asteriscos, "
+            "listas ni emojis: tu respuesta se lee en voz alta."
         )
         data = _gemini_rest(
             model=FALLBACK_MODEL,
@@ -711,10 +730,16 @@ class GeminiLiveSession:
                 model=FALLBACK_MODEL,
                 user_text=text,
                 system_instruction=(
-                    f"Eres Ivan, asistente de voz para macOS. Hoy es {_today_spanish()}. "
-                    "Identificá qué función ejecutar según la voz del usuario y llamala. "
-                    "Solo press_enter=True si el usuario dice 'y envía' o 'y ejecuta'. "
-                    "Si no hay función clara, no llames nada (no narres ni respondas)."
+                    "Sos Iván, asistente de voz para macOS, hablás ESPAÑOL "
+                    f"neutro latinoamericano. Hoy es {_today_spanish()}. "
+                    "Identificá qué función ejecutar según lo que dijo el "
+                    "usuario y llamala con los parámetros correctos. "
+                    "Ejemplos: 'abre youtube' → open_url(url='youtube.com'). "
+                    "'reproduce el video' → play_pause(). "
+                    "'busca tal cosa' → search_google(query='tal cosa'). "
+                    "Solo usá press_enter=True si el usuario dijo 'y envía' o "
+                    "'y ejecuta'. Si no hay función clara, no llames nada "
+                    "(no narres, no respondas en texto)."
                 ),
                 tools=TOOLS,
             )
