@@ -51,22 +51,34 @@ def draw_voice_indicator(frame, awake: bool, transcript: str = ""):
 
 def draw_status(frame, active: bool, attention_until: float,
                 gesture_l: str | None, gesture_r: str | None,
-                grabbed_app: str | None):
+                grabbed_app: str | None,
+                layer_gestures: bool = False, layer_voice: bool = False):
     h, w = frame.shape[:2]
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, 54), (8, 8, 10), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
 
-    status_text = "ACTIVO" if active else "STANDBY"
-    status_color = COLOR_GREEN if active else COLOR_MUTED
-    cv2.circle(frame, (22, 27), 7, status_color, -1, cv2.LINE_AA)
-    cv2.putText(frame, status_text, (38, 33),
-                cv2.FONT_HERSHEY_DUPLEX, 0.65, status_color, 1, cv2.LINE_AA)
+    # Layer badges instead of one status blob
+    gestures_color = COLOR_GREEN if layer_gestures else COLOR_MUTED
+    voice_color = COLOR_CYAN if layer_voice else COLOR_MUTED
 
-    if active:
+    cv2.circle(frame, (22, 27), 7, gestures_color, -1, cv2.LINE_AA)
+    cv2.putText(frame, "GESTOS", (34, 33),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, gestures_color, 1, cv2.LINE_AA)
+    cv2.circle(frame, (130, 27), 7, voice_color, -1, cv2.LINE_AA)
+    cv2.putText(frame, "VOICE", (142, 33),
+                cv2.FONT_HERSHEY_DUPLEX, 0.55, voice_color, 1, cv2.LINE_AA)
+
+    # Show voice idle countdown if voice is on
+    if layer_voice and attention_until < time.time() + 100:
         sec_left = max(0, int(attention_until - time.time()))
-        cv2.putText(frame, f"{sec_left}s", (150, 33),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_AMBER, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{sec_left}s", (225, 33),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_AMBER, 1, cv2.LINE_AA)
+
+    # Paused gestures banner when voice is on while gestures_enabled=True
+    if layer_voice and layer_gestures:
+        cv2.putText(frame, "gestos pausados", (280, 33),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (150, 150, 170), 1, cv2.LINE_AA)
 
     cv2.putText(frame, f"L {gesture_l or '-'}", (w - 260, 33),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55,

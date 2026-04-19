@@ -4,7 +4,7 @@ import subprocess
 import threading
 import time
 import numpy as np
-import sounddevice as sd
+import sounddevice as sd  # noqa: F401 — used for synth beeps below
 
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
@@ -69,6 +69,53 @@ def play_seeya():
         if p:
             _current_procs.append(p)
     threading.Thread(target=run, daemon=True).start()
+
+
+# ------------- SYNTH BEEPS (zero-dependency state change chimes) -------------
+
+def _synth_tone(start_hz: float, end_hz: float, duration_sec: float = 0.25, volume: float = 0.35):
+    """Play a short sine-wave tone that glides from start_hz to end_hz. Non-blocking."""
+    def run():
+        try:
+            sr = 22050
+            n = int(sr * duration_sec)
+            t = np.linspace(0, duration_sec, n, endpoint=False)
+            # Linear frequency glide
+            freq = np.linspace(start_hz, end_hz, n)
+            phase = np.cumsum(2 * np.pi * freq / sr)
+            wave = np.sin(phase).astype(np.float32) * volume
+            # Quick fade-in/out to avoid clicks
+            fade = min(int(sr * 0.02), n // 4)
+            if fade > 0:
+                env = np.ones(n, dtype=np.float32)
+                env[:fade] = np.linspace(0, 1, fade)
+                env[-fade:] = np.linspace(1, 0, fade)
+                wave *= env
+            sd.play(wave, samplerate=sr, blocking=False)
+        except Exception as e:
+            print(f"[audio] synth_tone failed: {e}")
+    threading.Thread(target=run, daemon=True).start()
+
+
+def beep_gestures_on():
+    """Ascending chirp — gestures turning on."""
+    _synth_tone(420, 720, duration_sec=0.22)
+
+
+def beep_gestures_off():
+    """Descending chirp — gestures turning off."""
+    _synth_tone(720, 380, duration_sec=0.22)
+
+
+def beep_voice_on_overlay():
+    """Quick double-click — voice turning on while gestures already on."""
+    _synth_tone(600, 900, duration_sec=0.12)
+    threading.Timer(0.16, lambda: _synth_tone(800, 1100, duration_sec=0.12)).start()
+
+
+def beep_gestures_resumed():
+    """Soft single note — gestures reactivate after voice-off."""
+    _synth_tone(520, 680, duration_sec=0.18)
 
 
 # ------------- CLAP DETECTION -------------

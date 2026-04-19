@@ -1,6 +1,7 @@
 """Gesture-control main loop: camera → gestures → OS actions."""
 import sys
 import time
+import threading
 import cv2
 import mediapipe as mp
 
@@ -17,18 +18,21 @@ from hud import (
 
 
 # -------------------- state --------------------
-ACTIVE = False
-ATTENTION_UNTIL = 0.0
-IDLE_TIMEOUT_SEC = 30.0
+# Two independent layers. Gestures run when gestures_enabled AND NOT voice_active.
+gestures_enabled = False
+voice_active = False
+
+VOICE_IDLE_TIMEOUT_SEC = 30.0   # voice auto-sleeps after this long without a command
 ACTION_COOLDOWN = 0.9
 HOLD_THRESHOLD_SEC = 1.0
-POST_GRAB_GRACE_SEC = 1.2  # ignore other gestures briefly after a grab/release
-POINTER_HANDOFF_HOLD_SEC = 0.8     # aim at another screen this long → teleport
-POINTER_HANDOFF_COOLDOWN_SEC = 1.5  # min gap between teleports (soft)
-STATE_CHANGE_COOLDOWN_SEC = 3.0    # min gap between activate/deactivate transitions
-CLAP_BLACKOUT_AFTER_ACTIVATE_SEC = 30.0  # ignore claps for 30s after activation (music playing)
-VOICE_BLACKOUT_AFTER_ACTIVATE_SEC = 30.0  # voice system ignores wake words for 30s after activation
-VOICE_GESTURE_DOMINANT_SEC = 2.0  # after a voice command, gestures pause for this long
+POST_GRAB_GRACE_SEC = 1.2       # ignore other gestures briefly after a grab/release
+POINTER_HANDOFF_HOLD_SEC = 0.8
+POINTER_HANDOFF_COOLDOWN_SEC = 1.5
+STATE_CHANGE_COOLDOWN_SEC = 1.5  # min gap between toggles of the same layer
+CLAP_BLACKOUT_AFTER_ACTIVATE_SEC = 30.0  # clap ignored during activation music
+VOICE_BLACKOUT_AFTER_ACTIVATE_SEC = 30.0
+VOICE_GESTURE_DOMINANT_SEC = 2.0
+DESCANSA_SILENCE_REQUIRED_SEC = 0.5  # require this much silence before acting on "descansa nexo"
 
 last_action_ts: dict[str, float] = {}
 flash_label: str | None = None
@@ -49,8 +53,11 @@ pointer_last_teleport_display: int | None = None
 last_move: dict | None = None  # {"window_el", "pid", "prev_display"}
 
 # Debounce state transitions (prevent activate→deactivate→activate loops)
-last_state_change_ts: float = 0.0
-last_activate_ts: float = 0.0
+last_gestures_change_ts: float = 0.0
+last_voice_change_ts: float = 0.0
+last_activate_ts: float = 0.0  # last time voice activated (for clap blackout)
+pending_voice_wake: bool = False  # "despierta nexo" heard mid-grab, apply after grab ends
+voice_last_activity_ts: float = 0.0  # last voice command (for idle timeout)
 
 # Voice system
 voice_sys: voice_mod.VoiceSystem | None = None
@@ -101,32 +108,75 @@ def fire_action(key: str, fn, label: str, cooldown: float = ACTION_COOLDOWN):
     flash(label)
 
 
-def activate():
-    global ACTIVE, ATTENTION_UNTIL, last_state_change_ts, last_activate_ts
+def toggle_gestures(target: bool | None = None):
+    """Turn the gestures layer on/off. target=None means toggle."""
+    global gestures_enabled, last_gestures_change_ts
     now = time.time()
-    if ACTIVE:
+    if now - last_gestures_change_ts < STATE_CHANGE_COOLDOWN_SEC:
         return
-    if now - last_state_change_ts < STATE_CHANGE_COOLDOWN_SEC:
+    new_state = (not gestures_enabled) if target is None else target
+    if new_state == gestures_enabled:
         return
-    ACTIVE = True
-    ATTENTION_UNTIL = now + IDLE_TIMEOUT_SEC
-    last_state_change_ts = now
+    gestures_enabled = new_state
+    last_gestures_change_ts = now
+    if new_state:
+        audio_mod.beep_gestures_on()
+        flash("GESTOS ON")
+    else:
+        audio_mod.beep_gestures_off()
+        flash("GESTOS OFF")
+
+
+def activate_voice():
+    """Turn on the voice layer. If gestures are currently on, pauses them silently."""
+    global voice_active, last_voice_change_ts, last_activate_ts, voice_last_activity_ts
+    now = time.time()
+    if voice_active:
+        return
+    if now - last_voice_change_ts < STATE_CHANGE_COOLDOWN_SEC:
+        return
+    voice_active = True
+    last_voice_change_ts = now
     last_activate_ts = now
-    flash("GESTOS ACTIVOS")
-    audio_mod.play_welcome_sequence()
+    voice_last_activity_ts = now
+    flash("VOICE ON")
+    if gestures_enabled:
+        # Shorter cue — gestures already on, we're just adding voice
+        audio_mod.beep_voice_on_overlay()
+    else:
+        # Full welcome ritual
+        audio_mod.play_welcome_sequence()
+
+
+def deactivate_voice():
+    """Turn off the voice layer. If gestures were enabled, they resume silently (soft cue)."""
+    global voice_active, last_voice_change_ts
+    now = time.time()
+    if not voice_active:
+        return
+    if now - last_voice_change_ts < STATE_CHANGE_COOLDOWN_SEC:
+        return
+    voice_active = False
+    last_voice_change_ts = now
+    flash("VOICE OFF")
+    audio_mod.play_seeya()
+    if gestures_enabled:
+        # Gestures are resuming — brief cue
+        threading.Timer(0.4, audio_mod.beep_gestures_resumed).start()
+
+
+def refresh_voice_activity():
+    global voice_last_activity_ts
+    voice_last_activity_ts = time.time()
+
+
+# Compatibility shims for the rest of the code that still references these names
+def activate():
+    toggle_gestures(True)
 
 
 def deactivate():
-    global ACTIVE, last_state_change_ts
-    now = time.time()
-    if not ACTIVE:
-        return
-    if now - last_state_change_ts < STATE_CHANGE_COOLDOWN_SEC:
-        return
-    ACTIVE = False
-    last_state_change_ts = now
-    flash("GESTOS OFF")
-    audio_mod.play_seeya()
+    toggle_gestures(False)
 
 
 def refresh_attention():
@@ -135,11 +185,12 @@ def refresh_attention():
 
 
 def main():
-    global ACTIVE, both_spread_since, both_fist_since, both_rock_since, ok_hold_since
+    global gestures_enabled, voice_active, both_spread_since, both_fist_since, both_rock_since, ok_hold_since
     global grabbed_window, grabbed_pid, grabbed_app_name, grab_active, grab_hand_side, grabbed_origin_display, grab_lost_frames
     global HAS_ACCESSIBILITY, grab_released_at
     global pointer_aiming_display, pointer_aiming_since, pointer_last_teleport_at, pointer_last_teleport_display
-    global last_move, last_state_change_ts, last_activate_ts, hand_trail
+    global last_move, last_gestures_change_ts, last_voice_change_ts, last_activate_ts, hand_trail
+    global pending_voice_wake, voice_last_activity_ts
 
     cap = None
     for cam_idx in range(4):
@@ -194,12 +245,12 @@ def main():
 
     last_perm_check = time.time()
 
-    # Double-clap activator (microphone) — alternative to spread×2
+    # Double-clap → TOGGLES the gestures layer (was: full activation)
     def _on_double_clap():
+        # Blackout while welcome music plays so beats don't misfire
         if time.time() - last_activate_ts < CLAP_BLACKOUT_AFTER_ACTIVATE_SEC:
             return
-        if not ACTIVE:
-            activate()
+        toggle_gestures()
 
     clap_det = audio_mod.ClapDetector(threshold=0.18, on_double_clap=_on_double_clap)
     try:
@@ -208,26 +259,34 @@ def main():
     except Exception as e:
         print(f"[startup] clap detector failed: {e}")
 
-    # Voice system — starts listening after voice blackout ends
+    # Voice system — Whisper listens locally; on wake word triggers VOICE layer
     global voice_sys, voice_last_transcript, voice_action_label, voice_action_until, last_voice_action_ts
 
     def _on_voice_state(state: str):
-        # voice system state change: awake/sleep
-        global voice_action_label, voice_action_until
-        label = "NEXO DESPIERTO" if state == "awake" else "NEXO DESCANSA"
-        voice_action_label = label
-        voice_action_until = time.time() + 1.5
-        print(f"[voice] state → {state}")
+        global voice_action_label, voice_action_until, pending_voice_wake
+        print(f"[voice] wake-word detected → {state}")
+        if state == "awake":
+            # "despierta nexo" — but defer if we're mid-grab to not lose the window
+            if grab_active:
+                pending_voice_wake = True
+                voice_action_label = "VOICE PENDIENTE (grab activo)"
+                voice_action_until = time.time() + 1.5
+            else:
+                activate_voice()
+        elif state == "sleep":
+            # "descansa nexo" — the voice module already enforces a brief silence
+            deactivate_voice()
 
     def _on_voice_transcript(text: str):
         global voice_last_transcript
         voice_last_transcript = text[:60]
 
     def _on_voice_action(label: str):
-        global voice_action_label, voice_action_until, last_voice_action_ts
+        global voice_action_label, voice_action_until, last_voice_action_ts, voice_last_activity_ts
         voice_action_label = label
         voice_action_until = time.time() + 1.8
         last_voice_action_ts = time.time()
+        voice_last_activity_ts = time.time()
         print(f"[voice] action: {label}")
 
     voice_sys = voice_mod.VoiceSystem(
@@ -237,7 +296,7 @@ def main():
     )
     try:
         voice_sys.start()
-        print("[startup] voice system running (awaiting 'despierta nexo')")
+        print("[startup] voice system running (wake: 'despierta nexo' / 'descansa nexo')")
     except Exception as e:
         print(f"[startup] voice system failed: {e}")
 
@@ -254,9 +313,17 @@ def main():
 
         left_hand = None
         right_hand = None
+        # Dim landmarks when voice is dominant (gestures paused)
+        gestures_paused = voice_active and gestures_enabled
         if result.multi_hand_landmarks:
             for lm in result.multi_hand_landmarks:
-                mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
+                if gestures_paused:
+                    # Draw on a separate buffer then blend with 40% alpha
+                    tmp = frame.copy()
+                    mp_draw.draw_landmarks(tmp, lm, mp_hands.HAND_CONNECTIONS)
+                    cv2.addWeighted(tmp, 0.4, frame, 0.6, 0, frame)
+                else:
+                    mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
                 if lm.landmark[0].x <= 0.5:
                     left_hand = lm
                 else:
@@ -270,25 +337,28 @@ def main():
             HAS_ACCESSIBILITY = windows.check_accessibility_permission()
             last_perm_check = time.time()
 
-        # -------- ATTENTION STATE --------
+        # -------- LAYER TOGGLES --------
         both_spread = (gesture_l == "spread" and gesture_r == "spread")
         both_fist = (gesture_l == "fist" and gesture_r == "fist")
         both_rock = (gesture_l == "rock" and gesture_r == "rock")
 
-        if both_spread and not ACTIVE:
+        # spread 2m 1s → toggle gestures layer (when currently off)
+        if both_spread and not gestures_enabled:
             if both_spread_since is None:
                 both_spread_since = time.time()
             elif time.time() - both_spread_since >= HOLD_THRESHOLD_SEC:
-                activate()
+                toggle_gestures(True)
                 both_spread_since = None
         else:
             both_spread_since = None
 
-        if both_fist and ACTIVE:
+        # fist 2m 0.4s → force gestures OFF (works during voice too: sets gestures_enabled=false
+        # so when voice ends gestures don't auto-resume)
+        if both_fist and gestures_enabled:
             if both_fist_since is None:
                 both_fist_since = time.time()
             elif time.time() - both_fist_since >= 0.4:
-                deactivate()
+                toggle_gestures(False)
                 both_fist_since = None
                 grab_active = False
                 grabbed_window = None
@@ -297,18 +367,24 @@ def main():
         else:
             both_fist_since = None
 
-        if ACTIVE and time.time() > ATTENTION_UNTIL and not grab_active:
-            deactivate()
+        # Voice auto-sleep when idle for VOICE_IDLE_TIMEOUT_SEC
+        if voice_active and time.time() - voice_last_activity_ts > VOICE_IDLE_TIMEOUT_SEC:
+            deactivate_voice()
 
-        # Voice idle auto-sleep: if voice awake but no command in 30s, auto-sleep it
-        if voice_sys is not None:
-            voice_sys.check_idle_sleep(30.0)
+        # Apply deferred voice wake if grab just ended
+        if pending_voice_wake and not grab_active:
+            pending_voice_wake = False
+            activate_voice()
 
-        # Voice dominance over gestures: after a recent voice action, pause gesture actions for 2s
+        # Effective gestures state: enabled AND voice is NOT active (voice dominates the layer)
+        gestures_effective = gestures_enabled and not voice_active
+
+        # Brief voice-dominance window after a voice action fires (prevents spread-release
+        # from typing in a terminal after a voice 'dicta X' command)
         voice_dominates = (time.time() - last_voice_action_ts) < VOICE_GESTURE_DOMINANT_SEC
 
         # -------- UNDO: rock with BOTH hands --------
-        if ACTIVE and both_rock and not grab_active:
+        if gestures_effective and both_rock and not grab_active:
             if both_rock_since is None:
                 both_rock_since = time.time()
             elif time.time() - both_rock_since >= 0.4 and last_move is not None:
@@ -327,8 +403,8 @@ def main():
         else:
             both_rock_since = None
 
-        # -------- ACTIONS (only when ACTIVE and voice not dominating) --------
-        if ACTIVE and not voice_dominates:
+        # -------- ACTIONS (only when gestures are effective and voice not dominating) --------
+        if gestures_effective and not voice_dominates:
             # GRAB detection: single-hand fist (not both)
             # Cross-screen grab: pick the primary window of the display where the hand is pointing.
             if not grab_active and (gesture_l == "fist") != (gesture_r == "fist"):
@@ -528,8 +604,13 @@ def main():
                     ok_hold_since = None
 
         # -------- DRAW --------
-        draw_status(frame, ACTIVE, ATTENTION_UNTIL, gesture_l, gesture_r,
-                    grabbed_app_name if grab_active else None)
+        # Status reflects the active layers — any-active is enough for the green dot
+        any_active = gestures_enabled or voice_active
+        draw_status(frame, any_active,
+                    voice_last_activity_ts + VOICE_IDLE_TIMEOUT_SEC if voice_active else time.time() + 999,
+                    gesture_l, gesture_r,
+                    grabbed_app_name if grab_active else None,
+                    layer_gestures=gestures_enabled, layer_voice=voice_active)
 
         # Side legends (always visible)
         draw_side_legend(frame, "left")
