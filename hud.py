@@ -150,7 +150,7 @@ def draw_side_legend(frame, side: str):
             (None, "spread 2m 1s", "ON"),
             (None, "fist 2m", "OFF"),
             ("MEDIA", None, None),
-            (None, "pinch", "play/pause"),
+            (None, "peace x2", "play/pause"),
             (None, "peace L", "previous"),
             (None, "peace R", "next"),
             ("VOLUMEN", None, None),

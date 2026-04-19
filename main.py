@@ -269,6 +269,12 @@ def main():
         min_tracking_confidence=0.5,
     )
 
+    # SelfieSegmentation: separa persona de fondo para poder blurrear solo el
+    # fondo y dejar al usuario nítido (estilo bokeh / videollamada pro).
+    mp_selfie = mp.solutions.selfie_segmentation
+    selfie = mp_selfie.SelfieSegmentation(model_selection=1)
+    import numpy as _np
+
     # Permission check (runs once)
     HAS_ACCESSIBILITY = windows.check_accessibility_permission()
     print(f"[startup] Accessibility permission: {HAS_ACCESSIBILITY}")
@@ -361,12 +367,22 @@ def main():
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = hands.process(rgb)
 
-        # Ambient background blur: gives the Iron Man HUD feel and hides the
-        # messy room behind the user. Kernel 51x51 = pronounced but cheap
-        # (~3-4 ms on 960x540). Landmarks & HUD are drawn sharp on top.
-        frame = cv2.GaussianBlur(frame, (51, 51), 0)
-        # Slight darken so the white HUD text pops
-        frame = cv2.addWeighted(frame, 0.85, frame, 0.0, -12)
+        # SelfieSeg: mask of the user (1.0=person, 0.0=background).
+        # We composite: person SHARP, background BLURRED + darkened heavily
+        # (≈98% glass-frosted feel requested).
+        seg = selfie.process(rgb)
+        mask = seg.segmentation_mask  # float HxW in [0,1]
+        # Soften the mask edges so the composite doesn't look cut-out
+        mask = cv2.GaussianBlur(mask, (15, 15), 0)
+        mask = _np.clip(mask, 0.0, 1.0)
+        mask3 = _np.repeat(mask[:, :, None], 3, axis=2)
+        # Heavy blur for background. Kernel must be odd; 81 ≈ "98% frosted"
+        bg = cv2.GaussianBlur(frame, (81, 81), 0)
+        # Darken the blurred bg so the HUD text and user pop even more
+        bg = cv2.addWeighted(bg, 0.72, bg, 0.0, -30)
+        # Composite: sharp person over blurred-dark bg
+        frame = (frame.astype(_np.float32) * mask3 +
+                 bg.astype(_np.float32) * (1.0 - mask3)).astype(_np.uint8)
 
         left_hand = None
         right_hand = None
@@ -631,14 +647,17 @@ def main():
                 # Non-drag gestures (only outside grace window AND after warmup)
                 # Warmup prevents MediaPipe's first-frame misclassifications
                 # ("point"/"three"/"pinch") from firing actions.
-                if not in_grace and gestures_warmed_up and (gesture_l == "pinch" or gesture_r == "pinch"):
+                # PLAY / PAUSE = both-hand peace (V) juntos. Unambiguo y
+                # distinto a single-hand peace (prev/next).
+                both_peace = (gesture_l == "peace" and gesture_r == "peace")
+                if not in_grace and gestures_warmed_up and both_peace:
                     fire_action("play_pause", media.play_pause, "PLAY / PAUSE")
                     refresh_attention()
-
-                if not in_grace and gestures_warmed_up and gesture_l == "peace":
+                # PREV / NEXT: peace SOLO con una mano (la otra no puede ser peace).
+                if not in_grace and gestures_warmed_up and gesture_l == "peace" and not both_peace:
                     fire_action("prev", media.previous_track, "PREV TRACK")
                     refresh_attention()
-                if not in_grace and gestures_warmed_up and gesture_r == "peace":
+                if not in_grace and gestures_warmed_up and gesture_r == "peace" and not both_peace:
                     fire_action("next", media.next_track, "NEXT TRACK")
                     refresh_attention()
 

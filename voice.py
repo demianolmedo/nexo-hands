@@ -940,51 +940,54 @@ class VoiceSystem:
             self._live.push_audio(chunk)
 
     def _scan_loop(self):
-        """Background thread: transcribe only after the user has FINISHED
-        speaking (end-of-utterance detected via a silence gap). This prevents
-        partial-sentence tool calls like "busca las dos" → "busca las dos
-        primeras frases"."""
+        """Background thread. When asleep, polls every 1.2s to detect the
+        wake word (responsive). When awake, waits for end-of-utterance
+        (silence gap) before transcribing so partial sentences don't fire
+        multiple tool calls."""
+        last_async_check = 0.0
         while self._running:
             time.sleep(0.15)
             now = time.time()
 
-            # If Gemini is thinking or we're speaking, don't transcribe — our
-            # own TTS would be picked up by the mic and cause an echo loop
-            # (double audio, runaway Gemini calls, eventually SIGTRAP).
+            # Don't transcribe our own TTS via the speaker→mic loop
             cur_state = self.get_processing_state()
             if cur_state in (self.STATE_THINKING, self.STATE_SPEAKING):
-                self.audio_buf.buf[:] = 0.0  # drop whatever we captured of ourselves
+                self.audio_buf.buf[:] = 0.0
                 continue
 
-            # Post-wake blackout while the activation ritual is audible — don't
-            # let Whisper transcribe the welcome chime / music as if it were a
-            # user command.
+            # Post-wake activation-music blackout
             if now < self._activation_blackout_until:
                 self.audio_buf.buf[:] = 0.0
                 continue
 
-            # End-of-utterance detection: only transcribe if user has been
-            # silent for END_OF_UTTERANCE_GAP seconds AND there was voice in
-            # the last ~3s AND we haven't already dispatched this utterance.
-            silence_gap = now - self._last_vad_ts
-            has_speech = self._last_vad_ts > 0
-            if has_speech and silence_gap < self.END_OF_UTTERANCE_GAP:
-                # Still mid-sentence — show LISTEN state, wait
+            # --- Wake-word mode: asleep, poll at 1.2s cadence like before ---
+            if not self._awake:
+                if now - last_async_check < 1.2:
+                    continue
+                last_async_check = now
+                audio = self.audio_buf.snapshot()
+                if np.max(np.abs(audio)) < 0.01:
+                    if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
+                        self._set_state(self.STATE_IDLE)
+                    continue
                 if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
                     self._set_state(self.STATE_LISTEN)
-                continue
-            # No new utterance pending (either no speech yet or we already
-            # dispatched the most recent one)
-            if self._last_vad_ts <= self._last_dispatched_vad_ts:
-                if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
-                    self._set_state(self.STATE_IDLE)
-                continue
-
-            audio = self.audio_buf.snapshot()
-            is_silent = np.max(np.abs(audio)) < 0.01
-            if is_silent:
-                self._last_dispatched_vad_ts = self._last_vad_ts
-                continue
+            else:
+                # --- Awake mode: end-of-utterance gating ---
+                silence_gap = now - self._last_vad_ts
+                has_speech = self._last_vad_ts > 0
+                if has_speech and silence_gap < self.END_OF_UTTERANCE_GAP:
+                    if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
+                        self._set_state(self.STATE_LISTEN)
+                    continue
+                if self._last_vad_ts <= self._last_dispatched_vad_ts:
+                    if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
+                        self._set_state(self.STATE_IDLE)
+                    continue
+                audio = self.audio_buf.snapshot()
+                if np.max(np.abs(audio)) < 0.01:
+                    self._last_dispatched_vad_ts = self._last_vad_ts
+                    continue
 
             try:
                 text = self._transcribe(audio, language="es")
