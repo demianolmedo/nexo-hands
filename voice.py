@@ -41,14 +41,17 @@ SAMPLE_RATE = 16000
 LIVE_MODEL = "gemini-3.1-flash-live-preview"          # WebSocket Live API, bidi audio
 FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"      # standard generate_content path
 
-# Wake words — simplified to single verbs that Whisper transcribes reliably.
-# Both "descansa" and "duerme" activate Gemini voice (per user preference).
-# To turn it off, say "gracias" (natural closing) or wait 30 s of silence.
+# Wake words — single verbs, no name.
+# OPEN  = "despierta"  (any inflection)
+# CLOSE = "descansa"   (any inflection)
 OPEN_VERBS = (
-    "descansa", "descanse", "descansan", "descanza", "descanzan", "descanso",
-    "duerme", "duerma", "duermen", "duermo",
+    "despierta", "despierte", "despierto", "despiertan",
+    "espierta", "espierte", "despiertar",
 )
-CLOSE_VERBS = ("gracias", "adiós", "adios", "chao", "chau")
+CLOSE_VERBS = (
+    "descansa", "descanse", "descansan", "descanza", "descanzan", "descanso",
+    "descansar",
+)
 
 
 # ----------------- FUNCTION DECLARATIONS -----------------
@@ -649,7 +652,7 @@ class VoiceSystem:
         _mic.subscribe(self._on_chunk)
         self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
         self._scan_thread.start()
-        print("[voice] system started (wake: 'descansa' → ON / 'duerme' → OFF)")
+        print("[voice] system started (wake: 'despierta' → ON / 'descansa' → OFF)")
 
     def stop(self):
         self._running = False
