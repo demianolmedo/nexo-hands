@@ -10,3 +10,4 @@ pynput==1.8.1
 sounddevice==0.5.5
 faster-whisper
 google-genai
+python-dotenv
