@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+# Copyright-protected audio (bring your own)
+assets/*.mp3
+assets/*.wav
+assets/*.m4a
+assets/*.flac
+# Ephemeral artifacts
+recordings/

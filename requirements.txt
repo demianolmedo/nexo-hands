@@ -1,0 +1,8 @@
+mediapipe==0.10.21
+opencv-python==4.8.1.78
+numpy==1.26.3
+pyautogui==0.9.54
+pyobjc-framework-Cocoa==10.3.2
+pyobjc-framework-Quartz==10.3.2
+pyobjc-framework-ApplicationServices==10.3.2
+setuptools<81
