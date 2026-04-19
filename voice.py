@@ -40,8 +40,15 @@ SAMPLE_RATE = 16000
 LIVE_MODEL = "gemini-live-2.5-flash-preview"   # latest live-capable model
 FALLBACK_MODEL = "gemini-2.0-flash-exp"
 
-WAKE_WORDS_OPEN = ("despierta nexo", "despierta, nexo", "nexo despierta")
-WAKE_WORDS_CLOSE = ("descansa nexo", "descansa, nexo", "nexo descansa")
+WAKE_WORDS_OPEN = (
+    "despierta nexo", "despierta, nexo", "nexo despierta",
+    "despiertan exo", "despierta neso", "despierta nueso",  # whisper mis-hear variants
+    "despierte nexo", "despierta necho",
+)
+WAKE_WORDS_CLOSE = (
+    "descansa nexo", "descansa, nexo", "nexo descansa",
+    "descansa neso", "descansa necho", "descansan exo",
+)
 
 
 # ----------------- FUNCTION DECLARATIONS -----------------
@@ -558,10 +565,16 @@ class VoiceSystem:
                 continue
 
             self.on_transcript(text[:60])
+            print(f"[voice] heard: {text!r}")  # debug aid — so the user can see what Whisper is hearing
 
-            if not self._awake and any(w in text for w in WAKE_WORDS_OPEN):
+            # Fuzzy wake-word match: require "nexo" / "neso" / "necho" + a wake-verb stem
+            has_nexo = any(tok in text for tok in ("nexo", "neso", "necho", "nueso"))
+            has_open = any(tok in text for tok in ("despierta", "despierte", "despierto", "despiertan"))
+            has_close = any(tok in text for tok in ("descansa", "descanse", "descansan"))
+
+            if not self._awake and has_nexo and has_open:
                 self._activate()
-            elif self._awake and any(w in text for w in WAKE_WORDS_CLOSE):
+            elif self._awake and has_nexo and has_close:
                 self._deactivate()
             elif self._awake and now - self._last_command_at > 3.0:
                 self._last_command_at = now

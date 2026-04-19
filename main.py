@@ -248,19 +248,24 @@ def main():
 
     last_perm_check = time.time()
 
-    # Double-clap → TOGGLES the gestures layer (was: full activation)
-    def _on_double_clap():
-        # Blackout while welcome music plays so beats don't misfire
-        if time.time() - last_activate_ts < CLAP_BLACKOUT_AFTER_ACTIVATE_SEC:
-            return
-        toggle_gestures()
-
-    clap_det = audio_mod.ClapDetector(threshold=0.18, on_double_clap=_on_double_clap)
-    try:
-        clap_det.start()
-        print("[startup] clap detector running")
-    except Exception as e:
-        print(f"[startup] clap detector failed: {e}")
+    # Clap detector DISABLED by default — too many false positives from speech
+    # and ambient noise with the user's mic setup. Enable only if you want to
+    # activate gestures without hands by clapping. Use spread-2m-1s instead.
+    ENABLE_CLAP_ACTIVATION = False
+    clap_det = None
+    if ENABLE_CLAP_ACTIVATION:
+        def _on_double_clap():
+            if time.time() - last_activate_ts < CLAP_BLACKOUT_AFTER_ACTIVATE_SEC:
+                return
+            toggle_gestures()
+        clap_det = audio_mod.ClapDetector(threshold=0.35, on_double_clap=_on_double_clap)
+        try:
+            clap_det.start()
+            print("[startup] clap detector running")
+        except Exception as e:
+            print(f"[startup] clap detector failed: {e}")
+    else:
+        print("[startup] clap detector DISABLED (use spread 2m 1s to activate gestures)")
 
     # Voice system — Whisper listens locally; on wake word triggers VOICE layer
     global voice_sys, voice_last_transcript, voice_action_label, voice_action_until, last_voice_action_ts
