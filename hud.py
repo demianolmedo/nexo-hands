@@ -66,11 +66,26 @@ def draw_voice_indicator(frame, awake: bool, transcript: str = "", processing_st
         cv2.circle(frame, (cx, cy), 8, (80, 80, 90), -1, cv2.LINE_AA)
 
     if transcript:
-        text = transcript[:50]
-        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-        y = h - 60
-        cv2.putText(frame, f'"{text}"', (w - text_size[0] - 40, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 200, 255), 1, cv2.LINE_AA)
+        # Movie-style caption: centered, larger, with translucent bar behind
+        text = transcript[:70]
+        font = cv2.FONT_HERSHEY_DUPLEX
+        scale = 0.8
+        thick = 2
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+        pad_x = 24
+        pad_y = 12
+        y_baseline = h - 130
+        x0 = (w - tw) // 2 - pad_x
+        x1 = x0 + tw + 2 * pad_x
+        y0 = y_baseline - th - pad_y
+        y1 = y_baseline + pad_y
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        cv2.putText(frame, text, ((w - tw) // 2, y_baseline),
+                    font, scale, (0, 0, 0), thick + 3, cv2.LINE_AA)
+        cv2.putText(frame, text, ((w - tw) // 2, y_baseline),
+                    font, scale, (220, 230, 255), thick, cv2.LINE_AA)
 
 
 def draw_status(frame, active: bool, attention_until: float,

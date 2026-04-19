@@ -255,14 +255,43 @@ def _speak_with_gemini_tts(text: str) -> bool:
         return False
 
 
+# Singleton Gemini client — creating a new one for every call leaks
+# multiprocessing semaphores in the preview SDK which eventually crash the
+# process with SIGTRAP ("resource_tracker: leaked semaphore objects").
+_genai_client: "genai.Client | None" = None
+
+
+def _get_client():
+    global _genai_client
+    if _genai_client is None:
+        _genai_client = genai.Client(api_key=GEMINI_API_KEY)
+    return _genai_client
+
+
+def _today_spanish() -> str:
+    from datetime import datetime
+    days_es = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    months_es = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+                 "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    now = datetime.now()
+    return f"{days_es[now.weekday()]} {now.day} de {months_es[now.month - 1]} de {now.year}"
+
+
 def exec_query_web(question: str) -> str:
-    """Answer a query: Gemini text response + Gemini TTS audio playback.
-    Falls back to macOS `say` if Gemini TTS fails."""
+    """Answer a query: Gemini text response → macOS `say` (Monica, es-MX).
+    Macuses say is stable; Gemini TTS preview is what was triggering SIGTRAP
+    after the first reply. We stay on `say` until the TTS SDK stabilizes."""
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        client = _get_client()
+        system_inst = (
+            f"Hoy es {_today_spanish()}. Respondé en español, breve "
+            f"(máximo 3 frases, 60 palabras). No inventes fechas: usá la de "
+            f"hoy si el usuario pregunta qué día es."
+        )
         response = client.models.generate_content(
             model=FALLBACK_MODEL,
-            contents=f"Responde en español de forma breve (máximo 3 frases, 60 palabras). Pregunta: {question}",
+            contents=question,
+            config=genai_types.GenerateContentConfig(system_instruction=system_inst),
         )
         answer = ""
         for cand in (response.candidates or []):
@@ -271,9 +300,7 @@ def exec_query_web(question: str) -> str:
                     answer = (answer + " " + part.text).strip()
         if not answer:
             return "QUERY (no response)"
-        # Prefer Gemini TTS (natural voice) — fall back to macOS `say` if that fails
-        if not _speak_with_gemini_tts(answer):
-            _speak_mac(answer)
+        _speak_mac(answer)
         return f"QUERY: {answer[:60]}..."
     except Exception as e:
         exec_search_google(question)
@@ -672,15 +699,16 @@ class GeminiLiveSession:
         if not self.api_key:
             return
         try:
-            client = genai.Client(api_key=self.api_key)
+            client = _get_client()
             response = client.models.generate_content(
                 model=FALLBACK_MODEL,
                 contents=text,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=(
-                        "Eres Ivan. Identifica qué función ejecutar según la voz del usuario. "
+                        f"Eres Ivan, asistente de voz para macOS. Hoy es {_today_spanish()}. "
+                        "Identificá qué función ejecutar según la voz del usuario y llamala. "
                         "Solo press_enter=True si el usuario dice 'y envía' o 'y ejecuta'. "
-                        "Si no hay función clara, no llames nada."
+                        "Si no hay función clara, no llames nada (no narres ni respondas)."
                     ),
                     tools=TOOLS,
                 ),
