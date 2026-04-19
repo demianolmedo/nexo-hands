@@ -720,6 +720,12 @@ class GeminiLiveSession:
 # ----------------- MAIN VOICE SYSTEM -----------------
 
 class VoiceSystem:
+    # Processing states for the HUD indicator
+    STATE_IDLE = "idle"          # not listening (asleep) OR listening silently
+    STATE_LISTEN = "listen"      # actively transcribing user speech
+    STATE_THINKING = "thinking"  # Gemini processing the command/query
+    STATE_SPEAKING = "speaking"  # TTS audio is playing
+
     def __init__(self, on_state_change=None, on_transcript=None, on_action=None):
         self.model = None
         self.audio_buf = AudioBuffer(seconds=3.0)
@@ -733,9 +739,19 @@ class VoiceSystem:
         self._running = False
         self._scan_thread: threading.Thread | None = None
         self._live: GeminiLiveSession | None = None
+        self._processing_state = self.STATE_IDLE
+        self._state_lock = threading.Lock()
 
         if not GEMINI_API_KEY:
             print("[voice] WARNING: GEMINI_API_KEY not set in .env — Gemini disabled")
+
+    def get_processing_state(self) -> str:
+        with self._state_lock:
+            return self._processing_state
+
+    def _set_state(self, state: str):
+        with self._state_lock:
+            self._processing_state = state
 
     def _ensure_model(self):
         if self.model is None:
@@ -767,7 +783,12 @@ class VoiceSystem:
             last_check = now
 
             audio = self.audio_buf.snapshot()
-            if np.max(np.abs(audio)) < 0.01:
+            is_silent = np.max(np.abs(audio)) < 0.01
+            # Only toggle IDLE/LISTEN based on voice activity; don't stomp on
+            # THINKING/SPEAKING states driven by the dispatch thread.
+            if self.get_processing_state() in (self.STATE_IDLE, self.STATE_LISTEN):
+                self._set_state(self.STATE_IDLE if is_silent else self.STATE_LISTEN)
+            if is_silent:
                 continue
 
             try:
@@ -789,7 +810,7 @@ class VoiceSystem:
                 self._activate()
             elif self._awake and has_close_verb:
                 self._deactivate()
-            elif self._awake and now - self._last_command_at > 3.0:
+            elif self._awake and now - self._last_command_at > 1.5:
                 self._last_command_at = now
                 self._last_activity = now
                 lower = text.lower()
@@ -805,13 +826,26 @@ class VoiceSystem:
                 if regex_hit is not None:
                     self.on_action(regex_hit[1] + " (local)")
                     continue
-                # Route to Gemini. In Live mode, Gemini already has the audio
-                # in realtime — we just flag whether we expect a spoken reply.
-                # In fallback/text mode, send the Whisper text explicitly.
+                # Route to Gemini in a background thread so the scan_loop keeps
+                # capturing audio and new commands aren't blocked while Gemini
+                # thinks / TTS plays. Clear the audio buffer so the same
+                # transcription doesn't get re-processed on the next scan.
                 if self._live is not None:
-                    self._live.set_expect_audio_reply(_is_query(text))
-                    if self._live.is_fallback():
-                        self._live.send_text_command(text)
+                    is_query = _is_query(text)
+                    self._live.set_expect_audio_reply(is_query)
+                    # Clear recent audio so the same phrase doesn't fire twice
+                    self.audio_buf.buf[:] = 0.0
+
+                    def _dispatch(t=text, q=is_query):
+                        self._set_state(
+                            self.STATE_SPEAKING if q else self.STATE_THINKING
+                        )
+                        try:
+                            if self._live and self._live.is_fallback():
+                                self._live.send_text_command(t)
+                        finally:
+                            self._set_state(self.STATE_IDLE)
+                    threading.Thread(target=_dispatch, daemon=True).start()
 
     def _activate(self):
         if self._awake:

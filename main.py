@@ -642,9 +642,14 @@ def main():
                 trail_px = [(int(tx * w), int(ty * h)) for _, tx, ty in hand_trail]
                 draw_drag_overlay(frame, (hx, hy), zone, trail_px)
 
-        # Voice indicator + transcript
+        # Voice indicator + transcript + processing state
         if voice_sys is not None:
-            draw_voice_indicator(frame, voice_sys.is_awake(), voice_last_transcript if voice_sys.is_awake() else "")
+            draw_voice_indicator(
+                frame,
+                voice_sys.is_awake(),
+                voice_last_transcript if voice_sys.is_awake() else "",
+                processing_state=voice_sys.get_processing_state(),
+            )
 
         # Flash in the center (voice action flashes take priority briefly)
         if time.time() < voice_action_until and voice_action_label:

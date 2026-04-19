@@ -26,22 +26,46 @@ GESTURE_COLORS = {
 }
 
 
-def draw_voice_indicator(frame, awake: bool, transcript: str = ""):
-    """Pulsing blue circle + transcription when voice is awake."""
+_STATE_COLORS = {
+    "idle":     (130, 130, 150),  # dim
+    "listen":   (80, 255, 160),   # green — actively hearing user
+    "thinking": (255, 200, 80),   # amber — waiting for Gemini
+    "speaking": (255, 120, 200),  # pink/magenta — TTS playing
+}
+_STATE_LABEL = {
+    "idle":     "",
+    "listen":   "escuchando",
+    "thinking": "pensando",
+    "speaking": "hablando",
+}
+
+
+def draw_voice_indicator(frame, awake: bool, transcript: str = "", processing_state: str = "idle"):
+    """Pulsing orb on the right side + state label + transcript, so the user
+    always knows whether the system is listening, thinking or speaking."""
     h, w = frame.shape[:2]
     cx, cy = w - 40, h // 2
+
     if awake:
-        pulse = (time.time() * 2) % 1.0
-        outer_r = int(20 + 10 * abs(0.5 - pulse) * 2)
-        cv2.circle(frame, (cx, cy), outer_r, (255, 200, 80), 2, cv2.LINE_AA)
-        cv2.circle(frame, (cx, cy), 12, (255, 220, 120), -1, cv2.LINE_AA)
-        cv2.putText(frame, "NEXO", (cx - 22, cy + 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 220, 120), 1, cv2.LINE_AA)
+        color = _STATE_COLORS.get(processing_state, _STATE_COLORS["idle"])
+        label = _STATE_LABEL.get(processing_state, "")
+
+        # Pulse speed depends on state (fast during thinking/speaking)
+        speed = 3.0 if processing_state in ("thinking", "speaking") else 2.0
+        pulse = (time.time() * speed) % 1.0
+        outer_r = int(22 + 14 * abs(0.5 - pulse) * 2)
+        cv2.circle(frame, (cx, cy), outer_r, color, 2, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), 13, color, -1, cv2.LINE_AA)
+        cv2.putText(frame, "NEXO", (cx - 22, cy + 36),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        if label:
+            ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.55, 1)[0]
+            cv2.putText(frame, label, (cx - ts[0] // 2, cy + 55),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.55, color, 1, cv2.LINE_AA)
     else:
         cv2.circle(frame, (cx, cy), 8, (80, 80, 90), -1, cv2.LINE_AA)
 
     if transcript:
-        # Show transcript near bottom-right
         text = transcript[:50]
         text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
         y = h - 60
