@@ -180,8 +180,11 @@ def deactivate():
 
 
 def refresh_attention():
-    global ATTENTION_UNTIL
-    ATTENTION_UNTIL = time.time() + IDLE_TIMEOUT_SEC
+    """Extend voice-layer idle timeout when user interacts. Gestures have no
+    auto-timeout, so calling this while only gestures are active is a no-op."""
+    global voice_last_activity_ts
+    if voice_active:
+        voice_last_activity_ts = time.time()
 
 
 def main():
