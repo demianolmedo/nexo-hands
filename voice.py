@@ -278,20 +278,25 @@ def _today_spanish() -> str:
 
 
 def exec_query_web(question: str) -> str:
-    """Answer a query: Gemini text response → macOS `say` (Monica, es-MX).
-    Macuses say is stable; Gemini TTS preview is what was triggering SIGTRAP
-    after the first reply. We stay on `say` until the TTS SDK stabilizes."""
+    """Answer a query with thinking_level=high (per docs, improves reasoning
+    on conversational questions) and read the result via macOS `say`."""
     try:
         client = _get_client()
         system_inst = (
             f"Hoy es {_today_spanish()}. Respondé en español, breve "
             f"(máximo 3 frases, 60 palabras). No inventes fechas: usá la de "
-            f"hoy si el usuario pregunta qué día es."
+            f"hoy si el usuario pregunta qué día es. No uses markdown, ni "
+            f"asteriscos, ni listas — la respuesta se lee en voz alta."
+        )
+        cfg = genai_types.GenerateContentConfig(
+            system_instruction=system_inst,
+            # Thinking mode for nuanced answers; supported by 3.1-flash-lite-preview
+            thinking_config=genai_types.ThinkingConfig(thinking_level="high"),
         )
         response = client.models.generate_content(
             model=FALLBACK_MODEL,
             contents=question,
-            config=genai_types.GenerateContentConfig(system_instruction=system_inst),
+            config=cfg,
         )
         answer = ""
         for cand in (response.candidates or []):
