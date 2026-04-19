@@ -209,22 +209,72 @@ def exec_paste() -> str:
     return "PASTE"
 
 
+TTS_MODEL = "gemini-3.1-flash-tts-preview"
+TTS_VOICE = "Kore"  # natural Spanish-capable voice
+
+
+def _speak_with_gemini_tts(text: str) -> bool:
+    """Generate audio from `text` via Gemini TTS Preview and play it with afplay.
+    Returns True on success, False on failure (caller can fall back to `say`)."""
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model=TTS_MODEL,
+            contents=text,
+            config=genai_types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=genai_types.SpeechConfig(
+                    voice_config=genai_types.VoiceConfig(
+                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                            voice_name=TTS_VOICE
+                        )
+                    )
+                ),
+            ),
+        )
+        pcm = b""
+        for cand in response.candidates or []:
+            for part in cand.content.parts or []:
+                inline = getattr(part, "inline_data", None)
+                if inline and getattr(inline, "data", None):
+                    pcm += bytes(inline.data)
+        if not pcm:
+            return False
+        import tempfile, wave
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            path = tf.name
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(24000)
+            wf.writeframes(pcm)
+        subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        print(f"[tts] gemini tts failed: {e}")
+        return False
+
+
 def exec_query_web(question: str) -> str:
+    """Answer a query: Gemini text response + Gemini TTS audio playback.
+    Falls back to macOS `say` if Gemini TTS fails."""
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         response = client.models.generate_content(
             model=FALLBACK_MODEL,
-            contents=f"Responde en español de forma breve (máximo 3 frases, 50 palabras). Pregunta: {question}",
+            contents=f"Responde en español de forma breve (máximo 3 frases, 60 palabras). Pregunta: {question}",
         )
         answer = ""
         for cand in (response.candidates or []):
             for part in (cand.content.parts or []):
                 if getattr(part, "text", None):
                     answer = (answer + " " + part.text).strip()
-        if answer:
+        if not answer:
+            return "QUERY (no response)"
+        # Prefer Gemini TTS (natural voice) — fall back to macOS `say` if that fails
+        if not _speak_with_gemini_tts(answer):
             _speak_mac(answer)
-            return f"QUERY: {answer[:60]}..."
-        return "QUERY (no response)"
+        return f"QUERY: {answer[:60]}..."
     except Exception as e:
         exec_search_google(question)
         return f"QUERY→search fallback: {str(e)[:40]}"
@@ -769,15 +819,22 @@ class VoiceSystem:
         self._awake = True
         self._last_activity = time.time()
         self._last_command_at = time.time()
-        if GEMINI_API_KEY and self._live is None:
+        # NOTE: We bypass the Live WebSocket for now. The google-genai preview
+        # SDK crashes with SIGTRAP when `gemini-3.1-flash-live-preview` returns
+        # its first audio response on this stack, and that's been reproduced
+        # across three implementation variants. We use the stable text-mode
+        # path (Whisper wake → generate_content with tools → Gemini TTS for
+        # query answers). Native Live streaming will come back when the SDK
+        # stabilizes. Fallback mode also means send_text_command is used.
+        if GEMINI_API_KEY:
             self._live = GeminiLiveSession(
                 api_key=GEMINI_API_KEY,
                 on_action=self.on_action,
                 on_transcript=self.on_transcript,
             )
-            self._live.start()
+            self._live._fallback_mode = True
         self.on_state_change("awake")
-        print("[voice] WAKE (live mode)")
+        print("[voice] WAKE (text mode + Gemini TTS)")
 
     def _deactivate(self):
         if not self._awake:
