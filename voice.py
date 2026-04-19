@@ -319,15 +319,43 @@ class AudioBuffer:
             return self.buf.copy()
 
 
-# ----------------- GEMINI LIVE SESSION -----------------
+# ----------------- GEMINI LIVE SESSION (per official docs) -----------------
+
+# Keywords that signal "the user wants a spoken answer" — only then do we
+# play back the audio Gemini returns. For everything else (commands), we
+# silently drain the PCM and only act on function_calls.
+QUERY_KEYWORDS = (
+    "dime", "dame", "hablame", "háblame", "hablemos", "cuéntame", "cuentame",
+    "explícame", "explicame", "explica", "qué ", "que ", "cuál", "cual",
+    "cómo ", "como ", "por qué", "por que", "cuánto", "cuanto",
+)
+
+
+def _is_query(text: str) -> bool:
+    t = (text or "").lower()
+    return any(kw in t for kw in QUERY_KEYWORDS)
+
 
 class GeminiLiveSession:
-    """Runs an asyncio event loop in its own thread. Exposes thread-safe
-    methods to send audio chunks and receive function-call results via callback.
+    """Owns an asyncio event loop in its own thread. Re-implemented per the
+    official Live API docs:
+      https://ai.google.dev/gemini-api/docs/live-api/capabilities
 
-    If the Live API fails to connect, degrades to text-based fallback via
-    standard generate_content in send_text_command().
+    Key differences vs the earlier attempt that crashed with SIGTRAP:
+      * Audio input wrapped in types.Blob (not a raw dict)
+      * response_modalities=["AUDIO"] plus output_audio_transcription: {} so we
+        receive the model's spoken reply as text too
+      * Explicit handling of server_content.output_transcription,
+        server_content.input_transcription, and server_content.turn_complete
+      * Only play back PCM when the latest user command was a query; for
+        command-style input we drain the bytes silently
+      * Session refresh every ~14 minutes (Live sessions cap at 15 min)
+      * After two consecutive connect failures, permanent fall-through to
+        text-mode (send_text_command) so voice never goes dark
     """
+
+    SESSION_LIFETIME_SEC = 14 * 60  # reconnect before the 15 min hard cap
+    MAX_CONSECUTIVE_CONNECT_FAILURES = 2
 
     def __init__(self, api_key: str, on_action, on_transcript):
         self.api_key = api_key
@@ -340,6 +368,10 @@ class GeminiLiveSession:
         self._running = False
         self._connected = False
         self._fallback_mode = False
+        self._connect_failures = 0
+        # Query-mode state (updated by main thread before it pushes audio)
+        self._expect_audio_reply = False
+        self._current_turn_audio: list[bytes] = []
 
     def start(self):
         if self._running:
@@ -357,105 +389,179 @@ class GeminiLiveSession:
             print(f"[voice-live] event loop crashed: {e}")
             self._fallback_mode = True
 
+    def set_expect_audio_reply(self, flag: bool):
+        """Main thread tells us the current user turn is a query (wants voice)."""
+        self._expect_audio_reply = flag
+
     async def _main(self):
-        self._audio_queue = asyncio.Queue(maxsize=100)
+        """Outer loop: repeatedly open a Live session until we're told to stop
+        or fall into permanent text fallback."""
+        self._audio_queue = asyncio.Queue(maxsize=200)
+
+        while self._running:
+            try:
+                await self._run_session_once()
+                # session_once returned cleanly → we just refreshed at 14 min
+                # loop back and open a fresh one
+                self._connect_failures = 0
+            except Exception as e:
+                self._connect_failures += 1
+                print(f"[voice-live] session error ({self._connect_failures}/{self.MAX_CONSECUTIVE_CONNECT_FAILURES}): {e}")
+                if self._connect_failures >= self.MAX_CONSECUTIVE_CONNECT_FAILURES:
+                    print("[voice-live] permanent fallback to text mode")
+                    self._fallback_mode = True
+                    self._connected = False
+                    # Drain any remaining queue to avoid backpressure on producers
+                    while self._running:
+                        try:
+                            await asyncio.wait_for(self._audio_queue.get(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            continue
+                    return
+                await asyncio.sleep(1.0)
+
+    async def _run_session_once(self):
         client = genai.Client(
             api_key=self.api_key,
             http_options={"api_version": "v1alpha"},
         )
-
         config = {
-            # native-audio model requires AUDIO output modality
             "response_modalities": ["AUDIO"],
+            "output_audio_transcription": {},
             "tools": TOOLS,
             "system_instruction": (
-                "Eres Ivan, asistente de voz en macOS. Interpretás voz del usuario "
-                "y ejecutás funciones. Cuando el usuario pida algo que matche alguna "
-                "función disponible, llamála sin narrar de más. Para queries de "
-                "información (dime, dame, explica), usá query_web. Las funciones "
-                "type_text y type_in_window NO presionan Enter por defecto; solo si "
-                "el usuario dice 'y envía' / 'y ejecuta' / 'y manda' usá press_enter=True. "
-                "Respondé en español, con voz breve y amable."
+                "Eres Ivan, asistente de voz para macOS. Cuando el usuario pida "
+                "ejecutar algo (abrir app, buscar, dictar, mover ventanas, play/pause), "
+                "llamá la función correspondiente sin narrar ni dar explicación. "
+                "Cuando el usuario te hable conversacionalmente (dime, explícame, "
+                "cuéntame, hablemos, qué, cuál), respondé breve en español. "
+                "type_text/type_in_window NO presionan Enter a menos que el usuario "
+                "diga 'y envía' o 'y ejecuta'. Nunca ejecutes comandos destructivos."
             ),
         }
 
+        session_start = time.time()
         try:
             async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
                 self._session = session
                 self._connected = True
+                self._connect_failures = 0
                 print(f"[voice-live] connected to {LIVE_MODEL}")
-                send_task = asyncio.create_task(self._send_audio_loop())
+                send_task = asyncio.create_task(self._send_audio_loop(session_start))
                 recv_task = asyncio.create_task(self._recv_loop())
-                await asyncio.gather(send_task, recv_task)
-        except Exception as e:
-            print(f"[voice-live] connect failed ({e}); fallback to text mode")
-            self._fallback_mode = True
+                # Wait for either task to finish (either by lifetime, error, or stop)
+                done, pending = await asyncio.wait(
+                    {send_task, recv_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+                for t in done:
+                    if t.exception():
+                        raise t.exception()
+        finally:
             self._connected = False
-            while self._running:
-                try:
-                    await asyncio.wait_for(self._audio_queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
+            self._session = None
 
-    async def _send_audio_loop(self):
+    async def _send_audio_loop(self, session_start: float):
+        """Send user audio to Gemini; exit to trigger a session refresh at ~14min."""
         while self._running:
+            if time.time() - session_start > self.SESSION_LIFETIME_SEC:
+                print("[voice-live] session lifetime reached, refreshing")
+                return
             try:
                 chunk = await asyncio.wait_for(self._audio_queue.get(), timeout=1.0)
                 if chunk is None:
                     continue
                 await self._session.send_realtime_input(
-                    audio={"data": chunk.tobytes(), "mime_type": "audio/pcm;rate=16000"}
+                    audio=genai_types.Blob(
+                        data=chunk.tobytes(),
+                        mime_type="audio/pcm;rate=16000",
+                    ),
                 )
             except asyncio.TimeoutError:
                 continue
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 print(f"[voice-live] send error: {e}")
                 await asyncio.sleep(0.5)
 
     async def _recv_loop(self):
-        """Receive loop. The model is configured with AUDIO modality, so responses
-        mainly contain audio chunks. We drain them (silently for now) plus handle
-        any tool calls. Every branch is wrapped so a malformed part doesn't kill
-        the process with a SIGTRAP / trace trap.
-        """
+        """Receive loop — drains audio, accumulates transcriptions, and routes
+        tool calls. If the user asked a query, we play back the audio PCM when
+        the turn finishes. Otherwise we discard the bytes."""
         try:
             async for response in self._session.receive():
                 try:
-                    # Text (rarely present with AUDIO-only modality, but keep just in case)
-                    t = getattr(response, "text", None)
-                    if t:
-                        self.on_transcript(str(t)[:120])
-
-                    # Top-level tool call
-                    tc = getattr(response, "tool_call", None)
-                    if tc:
-                        fcs = getattr(tc, "function_calls", None) or []
-                        for fc in fcs:
-                            await self._safe_fc(fc)
-
-                    # server_content may contain both audio parts and tool calls
                     sc = getattr(response, "server_content", None)
-                    if sc is not None:
-                        mt = getattr(sc, "model_turn", None)
-                        if mt is not None:
-                            parts = getattr(mt, "parts", None) or []
-                            for p in parts:
-                                # Audio chunk — drain, don't accumulate
-                                inline = getattr(p, "inline_data", None)
-                                if inline is not None:
-                                    # we intentionally discard; TTS comes through but we
-                                    # don't need to reproduce it (macOS `say` is used for
-                                    # query answers). Simply consuming the bytes keeps
-                                    # the WebSocket buffer from backing up.
-                                    _ = getattr(inline, "data", None)
-                                # Tool call embedded in a model-turn part
-                                fc = getattr(p, "function_call", None)
-                                if fc is not None and getattr(fc, "name", None):
-                                    await self._safe_fc(fc)
+                    if sc is None:
+                        # Top-level tool call (rare but possible)
+                        tc = getattr(response, "tool_call", None)
+                        if tc:
+                            for fc in (getattr(tc, "function_calls", None) or []):
+                                await self._safe_fc(fc)
+                        continue
+
+                    # User ASR transcript (what Gemini thinks we said)
+                    it = getattr(sc, "input_transcription", None)
+                    if it is not None:
+                        t = getattr(it, "text", None)
+                        if t:
+                            self.on_transcript(str(t)[:120])
+
+                    # Gemini's spoken reply, as text
+                    ot = getattr(sc, "output_transcription", None)
+                    if ot is not None:
+                        t = getattr(ot, "text", None)
+                        if t:
+                            # Show it in the HUD action log
+                            self.on_action(f"> {str(t)[:80]}")
+
+                    mt = getattr(sc, "model_turn", None)
+                    if mt is not None:
+                        for p in (getattr(mt, "parts", None) or []):
+                            inline = getattr(p, "inline_data", None)
+                            if inline is not None:
+                                data = getattr(inline, "data", None)
+                                if data:
+                                    # Accumulate PCM for the current turn; we'll
+                                    # decide whether to play it at turn_complete.
+                                    self._current_turn_audio.append(bytes(data))
+                            fc = getattr(p, "function_call", None)
+                            if fc is not None and getattr(fc, "name", None):
+                                await self._safe_fc(fc)
+
+                    if getattr(sc, "turn_complete", False):
+                        # End of model's turn — maybe play back the audio
+                        if self._expect_audio_reply and self._current_turn_audio:
+                            pcm_bytes = b"".join(self._current_turn_audio)
+                            self._play_pcm_bytes_async(pcm_bytes)
+                        self._current_turn_audio.clear()
+                        self._expect_audio_reply = False
                 except Exception as inner:
                     print(f"[voice-live] part handler error: {inner}")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             print(f"[voice-live] recv loop error: {e}")
+
+    def _play_pcm_bytes_async(self, pcm_bytes: bytes):
+        """Write PCM to a tmp WAV and afplay it. Runs in its own thread; non-blocking."""
+        def run():
+            try:
+                import tempfile, wave, subprocess
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                    path = tf.name
+                with wave.open(path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)       # 16-bit
+                    wf.setframerate(24000)   # Gemini Live audio out is 24 kHz
+                    wf.writeframes(pcm_bytes)
+                subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"[voice-live] tts playback failed: {e}")
+        threading.Thread(target=run, daemon=True).start()
 
     async def _safe_fc(self, fc):
         try:
@@ -486,8 +592,8 @@ class GeminiLiveSession:
         except Exception as e:
             self.on_action(f"ERROR {name}: {e}")
 
-    # Buffer a few chunks before sending so we don't flood the WebSocket with
-    # sub-100ms packets (which sometimes destabilize the SDK).
+    # --- thread-safe audio push ---
+
     _push_buffer: list = []
     _push_samples = 0
     _PUSH_MIN_SAMPLES = 3200  # 200 ms @ 16 kHz
@@ -649,8 +755,13 @@ class VoiceSystem:
                 if regex_hit is not None:
                     self.on_action(regex_hit[1] + " (local)")
                     continue
-                if self._live and self._live.is_fallback():
-                    self._live.send_text_command(text)
+                # Route to Gemini. In Live mode, Gemini already has the audio
+                # in realtime — we just flag whether we expect a spoken reply.
+                # In fallback/text mode, send the Whisper text explicitly.
+                if self._live is not None:
+                    self._live.set_expect_audio_reply(_is_query(text))
+                    if self._live.is_fallback():
+                        self._live.send_text_command(text)
 
     def _activate(self):
         if self._awake:
@@ -658,20 +769,15 @@ class VoiceSystem:
         self._awake = True
         self._last_activity = time.time()
         self._last_command_at = time.time()
-        # Text mode by default — Live API (gemini-3.1-flash-live-preview with AUDIO
-        # modality) is currently unstable in the google-genai preview SDK on this
-        # stack (SIGTRAP after processing the first command). We stick with
-        # Whisper-local transcription + generate_content until the SDK stabilizes.
-        if GEMINI_API_KEY:
-            # Dummy session object so send_text_command is callable via _live
+        if GEMINI_API_KEY and self._live is None:
             self._live = GeminiLiveSession(
                 api_key=GEMINI_API_KEY,
                 on_action=self.on_action,
                 on_transcript=self.on_transcript,
             )
-            self._live._fallback_mode = True  # force non-Live path
+            self._live.start()
         self.on_state_change("awake")
-        print("[voice] WAKE (text mode)")
+        print("[voice] WAKE (live mode)")
 
     def _deactivate(self):
         if not self._awake:
