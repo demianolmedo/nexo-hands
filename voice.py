@@ -41,11 +41,11 @@ SAMPLE_RATE = 16000
 LIVE_MODEL = "gemini-3.1-flash-live-preview"          # WebSocket Live API, bidi audio
 FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"      # standard generate_content path
 
-# Wake words use "ivan" (user's preference over "nexo"). Whisper tiny often
-# mistranscribes names; we fuzzy-match a wake verb stem + a name variant.
-NAME_VARIANTS = ("ivan", "iván", "ibán", "iban", "ibam", "eban")
-OPEN_VERBS = ("despierta", "despierte", "despierto", "despiertan")
-CLOSE_VERBS = ("descansa", "descanse", "descansan", "descanza", "descanzan")
+# Wake words — simplified to single verbs that Whisper transcribes reliably.
+# Whisper tiny often mis-hears proper names in Spanish audio, so we dropped the
+# name requirement and use just a verb stem. Match is case-insensitive.
+OPEN_VERBS = ("descansa", "descanse", "descansan", "descanza", "descanzan", "descanso")
+CLOSE_VERBS = ("duerme", "duerma", "duermen", "duermo", "durmi", "durmiendo")
 
 
 # ----------------- FUNCTION DECLARATIONS -----------------
@@ -576,13 +576,12 @@ class VoiceSystem:
             self.on_transcript(text[:60])
             print(f"[voice] heard: {text!r}")
 
-            has_name = any(n in text for n in NAME_VARIANTS)
             has_open_verb = any(v in text for v in OPEN_VERBS)
             has_close_verb = any(v in text for v in CLOSE_VERBS)
 
-            if not self._awake and has_name and has_open_verb:
+            if not self._awake and has_open_verb:
                 self._activate()
-            elif self._awake and has_name and has_close_verb:
+            elif self._awake and has_close_verb:
                 self._deactivate()
             elif self._awake and now - self._last_command_at > 3.0:
                 self._last_command_at = now
@@ -647,7 +646,7 @@ class VoiceSystem:
         _mic.subscribe(self._on_chunk)
         self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
         self._scan_thread.start()
-        print("[voice] system started (wake: 'despierta nexo' / 'descansa nexo')")
+        print("[voice] system started (wake: 'descansa' → ON / 'duerme' → OFF)")
 
     def stop(self):
         self._running = False

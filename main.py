@@ -304,7 +304,7 @@ def main():
     )
     try:
         voice_sys.start()
-        print("[startup] voice system running (wake: 'despierta nexo' / 'descansa nexo')")
+        print("[startup] voice system running (wake: 'descansa' / sleep: 'duerme')")
     except Exception as e:
         print(f"[startup] voice system failed: {e}")
 
