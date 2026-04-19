@@ -413,24 +413,55 @@ class GeminiLiveSession:
                 await asyncio.sleep(0.5)
 
     async def _recv_loop(self):
+        """Receive loop. The model is configured with AUDIO modality, so responses
+        mainly contain audio chunks. We drain them (silently for now) plus handle
+        any tool calls. Every branch is wrapped so a malformed part doesn't kill
+        the process with a SIGTRAP / trace trap.
+        """
         try:
             async for response in self._session.receive():
-                if hasattr(response, "text") and response.text:
-                    self.on_transcript(response.text)
-                tc = getattr(response, "tool_call", None)
-                if tc and getattr(tc, "function_calls", None):
-                    for fc in tc.function_calls:
-                        await self._handle_function_call(fc)
-                sc = getattr(response, "server_content", None)
-                if sc:
-                    mt = getattr(sc, "model_turn", None)
-                    if mt and getattr(mt, "parts", None):
-                        for p in mt.parts:
-                            fc = getattr(p, "function_call", None)
-                            if fc and fc.name:
-                                await self._handle_function_call(fc)
+                try:
+                    # Text (rarely present with AUDIO-only modality, but keep just in case)
+                    t = getattr(response, "text", None)
+                    if t:
+                        self.on_transcript(str(t)[:120])
+
+                    # Top-level tool call
+                    tc = getattr(response, "tool_call", None)
+                    if tc:
+                        fcs = getattr(tc, "function_calls", None) or []
+                        for fc in fcs:
+                            await self._safe_fc(fc)
+
+                    # server_content may contain both audio parts and tool calls
+                    sc = getattr(response, "server_content", None)
+                    if sc is not None:
+                        mt = getattr(sc, "model_turn", None)
+                        if mt is not None:
+                            parts = getattr(mt, "parts", None) or []
+                            for p in parts:
+                                # Audio chunk — drain, don't accumulate
+                                inline = getattr(p, "inline_data", None)
+                                if inline is not None:
+                                    # we intentionally discard; TTS comes through but we
+                                    # don't need to reproduce it (macOS `say` is used for
+                                    # query answers). Simply consuming the bytes keeps
+                                    # the WebSocket buffer from backing up.
+                                    _ = getattr(inline, "data", None)
+                                # Tool call embedded in a model-turn part
+                                fc = getattr(p, "function_call", None)
+                                if fc is not None and getattr(fc, "name", None):
+                                    await self._safe_fc(fc)
+                except Exception as inner:
+                    print(f"[voice-live] part handler error: {inner}")
         except Exception as e:
             print(f"[voice-live] recv loop error: {e}")
+
+    async def _safe_fc(self, fc):
+        try:
+            await self._handle_function_call(fc)
+        except Exception as e:
+            print(f"[voice-live] fc error: {e}")
 
     async def _handle_function_call(self, fc):
         name = fc.name
@@ -455,10 +486,23 @@ class GeminiLiveSession:
         except Exception as e:
             self.on_action(f"ERROR {name}: {e}")
 
+    # Buffer a few chunks before sending so we don't flood the WebSocket with
+    # sub-100ms packets (which sometimes destabilize the SDK).
+    _push_buffer: list = []
+    _push_samples = 0
+    _PUSH_MIN_SAMPLES = 3200  # 200 ms @ 16 kHz
+
     def push_audio(self, audio: np.ndarray):
         if not self._connected or self._audio_queue is None or self._loop is None:
             return
-        pcm16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+        self._push_buffer.append(audio.astype(np.float32, copy=False))
+        self._push_samples += len(audio)
+        if self._push_samples < self._PUSH_MIN_SAMPLES:
+            return
+        combined = np.concatenate(self._push_buffer)
+        self._push_buffer = []
+        self._push_samples = 0
+        pcm16 = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
         try:
             asyncio.run_coroutine_threadsafe(self._audio_queue.put(pcm16), self._loop)
         except Exception:
