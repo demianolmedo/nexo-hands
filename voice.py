@@ -110,6 +110,90 @@ BLOCKED_SHELL_PATTERNS = [
 ]
 
 
+# ----------------- REGEX PRE-FILTER -----------------
+# Simple commands matched locally without calling Gemini. Each rule is
+# (compiled regex, handler fn, label). First match wins.
+
+import re
+
+_KNOWN_APPS = {
+    "chrome": "Google Chrome",
+    "google chrome": "Google Chrome",
+    "safari": "Safari",
+    "spotify": "Spotify",
+    "notion": "Notion",
+    "terminal": "Terminal",
+    "iterm": "iTerm",
+    "finder": "Finder",
+    "music": "Music",
+    "mail": "Mail",
+    "slack": "Slack",
+    "telegram": "Telegram",
+    "whatsapp": "WhatsApp",
+    "zoom": "zoom.us",
+    "vscode": "Visual Studio Code",
+    "code": "Visual Studio Code",
+    "xcode": "Xcode",
+    "preview": "Preview",
+    "calculator": "Calculator",
+    "calendar": "Calendar",
+    "notes": "Notes",
+    "reminders": "Reminders",
+}
+
+
+def _regex_prefilter(text: str):
+    """Return (handler_result, label) if a local regex matched, else None.
+    All patterns are Spanish-first; English variants added where common."""
+    t = text.strip().lower()
+
+    # Media controls
+    if re.search(r"\b(pausa|pause|para|stop)\b", t) and "nexo" not in t[:15]:
+        return exec_play_pause(), "PAUSE"
+    if re.search(r"\b(reproduce|play|reanuda|continúa|continua)\b", t):
+        return exec_play_pause(), "PLAY"
+    if re.search(r"\b(siguiente|next|próxima|proxima)\b.*\b(canción|cancion|track|song)?\b", t):
+        return exec_next_track(), "NEXT"
+    if re.search(r"\b(anterior|previous|previa)\b.*\b(canción|cancion|track|song)?\b", t):
+        return exec_previous_track(), "PREV"
+
+    # Clipboard
+    if re.fullmatch(r"\s*(copia|copiar|copy)\s*\.?\s*", t):
+        return exec_copy(), "COPY"
+    if re.fullmatch(r"\s*(pega|pegar|paste)\s*\.?\s*", t):
+        return exec_paste(), "PASTE"
+
+    # Open known app
+    m = re.search(r"\b(abre|abrir|open|lanza|launch)\s+(.{2,40})", t)
+    if m:
+        target = m.group(2).strip(".,?! ")
+        # URL?
+        if target.startswith("http") or re.match(r"^[\w.-]+\.(com|org|net|io|app|dev|ai|co|es|ar|bo|ve|mx)(/.*)?$", target):
+            return exec_open_url(target), f"URL {target[:30]}"
+        # Known app?
+        target_lower = target.lower()
+        for key, app_name in _KNOWN_APPS.items():
+            if key in target_lower:
+                return exec_open_app(app_name), f"APP {app_name}"
+
+    # Search
+    m = re.search(r"\b(busca|buscar|search)\s+(.+)", t)
+    if m:
+        query = m.group(2).strip(".,?! ")
+        return exec_search_google(query), f"SEARCH {query[:30]}"
+
+    return None
+
+
+def _try_regex(text: str):
+    """Wrapper with try/except so a bad regex never kills the voice loop."""
+    try:
+        return _regex_prefilter(text)
+    except Exception as e:
+        print(f"[voice] regex prefilter error: {e}")
+        return None
+
+
 # ----------------- AUDIO UTILS -----------------
 
 class AudioBuffer:
@@ -250,9 +334,39 @@ def exec_paste() -> str:
     return "PASTE"
 
 
+def _speak_mac(text: str, voice: str = "Monica"):
+    """Use macOS native `say` for quick TTS. Non-blocking."""
+    try:
+        subprocess.Popen(["say", "-v", voice, text[:500]],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def exec_query_web(question: str) -> str:
-    # For MVP we just delegate to a google search — audio-answer is left for v2 (requires TTS)
-    return exec_search_google(question)
+    """Answer a query via Gemini and speak the response back with macOS TTS.
+    For queries like 'dame resumen noticias IA' or 'qué clima hace'."""
+    try:
+        from google import genai
+        from google.genai import types as gt
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-exp",
+            contents=f"Responde en español de forma breve (máximo 3 frases, 50 palabras). Pregunta: {question}",
+        )
+        answer = ""
+        for cand in (response.candidates or []):
+            for part in (cand.content.parts or []):
+                if getattr(part, "text", None):
+                    answer = (answer + " " + part.text).strip()
+        if answer:
+            _speak_mac(answer)
+            return f"QUERY: {answer[:60]}..."
+        return "QUERY (no response)"
+    except Exception as e:
+        # Fall back to just opening a google search
+        exec_search_google(question)
+        return f"QUERY fallback→search: {str(e)[:40]}"
 
 
 FN_DISPATCH = {
@@ -362,17 +476,25 @@ class VoiceSystem:
         print("[voice] SLEEP")
 
     def _handle_command(self, text: str):
-        """Send text to Gemini for function calling; execute whatever it returns."""
+        """Try regex prefilter first; fall back to Gemini for complex commands."""
         self._last_command_at = time.time()
         self._last_activity = time.time()
 
-        # Security: pre-check for blocked shell patterns
+        # Security: pre-check for blocked shell patterns (applies to both regex and Gemini path)
         lower = text.lower()
         for pat in BLOCKED_SHELL_PATTERNS:
             if pat in lower:
                 self.on_action(f"BLOCKED: '{pat}' no permitido")
                 return
 
+        # Try regex first — local, instant, free
+        regex_result = _try_regex(text)
+        if regex_result is not None:
+            _, label = regex_result
+            self.on_action(label + " (local)")
+            return
+
+        # Fall through to Gemini for complex commands
         self._ensure_gemini()
 
         try:
