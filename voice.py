@@ -42,10 +42,13 @@ LIVE_MODEL = "gemini-3.1-flash-live-preview"          # WebSocket Live API, bidi
 FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"      # standard generate_content path
 
 # Wake words — simplified to single verbs that Whisper transcribes reliably.
-# Whisper tiny often mis-hears proper names in Spanish audio, so we dropped the
-# name requirement and use just a verb stem. Match is case-insensitive.
-OPEN_VERBS = ("descansa", "descanse", "descansan", "descanza", "descanzan", "descanso")
-CLOSE_VERBS = ("duerme", "duerma", "duermen", "duermo", "durmi", "durmiendo")
+# Both "descansa" and "duerme" activate Gemini voice (per user preference).
+# To turn it off, say "gracias" (natural closing) or wait 30 s of silence.
+OPEN_VERBS = (
+    "descansa", "descanse", "descansan", "descanza", "descanzan", "descanso",
+    "duerme", "duerma", "duermen", "duermo",
+)
+CLOSE_VERBS = ("gracias", "adiós", "adios", "chao", "chau")
 
 
 # ----------------- FUNCTION DECLARATIONS -----------------
