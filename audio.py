@@ -121,23 +121,23 @@ def beep_gestures_resumed():
 # ------------- CLAP DETECTION -------------
 
 class ClapDetector:
+    """Consumes audio chunks from the shared `mic` broker.
+    Two close-together loud peaks within (min_gap, max_gap) fire on_double_clap."""
+
     def __init__(self, threshold=0.15, min_gap=0.18, max_gap=0.8, on_double_clap=None):
         self.threshold = threshold
         self.min_gap = min_gap
         self.max_gap = max_gap
         self.on_double_clap = on_double_clap
         self.last_peak_ts = 0.0
-        self.last_reset_ts = 0.0
         self.peak_count = 0
         self._running = False
-        self._stream = None
 
-    def _callback(self, indata, frames, t, status):
-        if status:
+    def _on_chunk(self, chunk: np.ndarray):
+        if not self._running:
             return
-        rms = float(np.sqrt(np.mean(indata ** 2)))
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
         now = time.time()
-        # peak detection with refractory period (ignore very close events = echo)
         if rms > self.threshold:
             gap_since_last = now - self.last_peak_ts
             if gap_since_last < self.min_gap:
@@ -145,7 +145,6 @@ class ClapDetector:
             self.last_peak_ts = now
             self.peak_count += 1
             if self.peak_count >= 2 and gap_since_last <= self.max_gap:
-                # double clap detected!
                 self.peak_count = 0
                 if self.on_double_clap:
                     try:
@@ -153,7 +152,6 @@ class ClapDetector:
                     except Exception as e:
                         print(f"[clap] handler error: {e}")
         else:
-            # decay peak counter if no recent clap
             if now - self.last_peak_ts > self.max_gap:
                 self.peak_count = 0
 
@@ -161,20 +159,12 @@ class ClapDetector:
         if self._running:
             return
         self._running = True
-        self._stream = sd.InputStream(
-            callback=self._callback,
-            channels=1,
-            samplerate=22050,
-            blocksize=1024,
-        )
-        self._stream.start()
+        import mic as _mic
+        if not _mic.is_started():
+            _mic.start()
+        _mic.subscribe(self._on_chunk)
 
     def stop(self):
         self._running = False
-        if self._stream:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
+        import mic as _mic
+        _mic.unsubscribe(self._on_chunk)

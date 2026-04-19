@@ -509,7 +509,6 @@ class VoiceSystem:
         self._last_activity = 0.0
         self._last_command_at = 0.0
         self._running = False
-        self._stream: sd.InputStream | None = None
         self._scan_thread: threading.Thread | None = None
         self._live: GeminiLiveSession | None = None
 
@@ -528,8 +527,8 @@ class VoiceSystem:
         )
         return " ".join(s.text.strip() for s in segments).strip().lower()
 
-    def _audio_callback(self, indata, frames, t, status):
-        chunk = indata[:, 0].astype(np.float32)
+    def _on_chunk(self, chunk: np.ndarray):
+        """Called by the shared mic broker for each audio chunk."""
         self.audio_buf.push(chunk)
         if self._awake and self._live is not None and not self._live.is_fallback():
             self._live.push_audio(chunk)
@@ -621,25 +620,20 @@ class VoiceSystem:
             return
         self._ensure_model()
         self._running = True
-        self._stream = sd.InputStream(
-            callback=self._audio_callback, channels=1,
-            samplerate=SAMPLE_RATE, blocksize=4096,
-        )
-        self._stream.start()
+        import mic as _mic
+        if not _mic.is_started():
+            _mic.start()
+        _mic.subscribe(self._on_chunk)
         self._scan_thread = threading.Thread(target=self._scan_loop, daemon=True)
         self._scan_thread.start()
         print("[voice] system started (wake: 'despierta nexo' / 'descansa nexo')")
 
     def stop(self):
         self._running = False
+        import mic as _mic
+        _mic.unsubscribe(self._on_chunk)
         if self._live:
             try:
                 self._live.stop()
             except Exception:
                 pass
-        if self._stream:
-            try:
-                self._stream.stop(); self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
