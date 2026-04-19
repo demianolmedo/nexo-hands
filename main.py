@@ -8,10 +8,11 @@ from gestures import detect_gesture
 import media
 import windows
 import audio as audio_mod
+import voice as voice_mod
 from hud import (
     draw_status, draw_drag_overlay,
     draw_side_legend, draw_action_log, draw_permission_banner,
-    draw_action_flash,
+    draw_action_flash, draw_voice_indicator,
 )
 
 
@@ -25,7 +26,9 @@ POST_GRAB_GRACE_SEC = 1.2  # ignore other gestures briefly after a grab/release
 POINTER_HANDOFF_HOLD_SEC = 0.8     # aim at another screen this long → teleport
 POINTER_HANDOFF_COOLDOWN_SEC = 1.5  # min gap between teleports (soft)
 STATE_CHANGE_COOLDOWN_SEC = 3.0    # min gap between activate/deactivate transitions
-CLAP_BLACKOUT_AFTER_ACTIVATE_SEC = 40.0  # ignore claps for 40s after activation (music playing)
+CLAP_BLACKOUT_AFTER_ACTIVATE_SEC = 30.0  # ignore claps for 30s after activation (music playing)
+VOICE_BLACKOUT_AFTER_ACTIVATE_SEC = 30.0  # voice system ignores wake words for 30s after activation
+VOICE_GESTURE_DOMINANT_SEC = 2.0  # after a voice command, gestures pause for this long
 
 last_action_ts: dict[str, float] = {}
 flash_label: str | None = None
@@ -48,6 +51,13 @@ last_move: dict | None = None  # {"window_el", "pid", "prev_display"}
 # Debounce state transitions (prevent activate→deactivate→activate loops)
 last_state_change_ts: float = 0.0
 last_activate_ts: float = 0.0
+
+# Voice system
+voice_sys: voice_mod.VoiceSystem | None = None
+last_voice_action_ts: float = 0.0
+voice_last_transcript: str = ""
+voice_action_label: str = ""
+voice_action_until: float = 0.0
 
 # Grab state
 grabbed_window = None
@@ -186,7 +196,6 @@ def main():
 
     # Double-clap activator (microphone) — alternative to spread×2
     def _on_double_clap():
-        # Ignore claps during activation music playback to avoid self-triggering
         if time.time() - last_activate_ts < CLAP_BLACKOUT_AFTER_ACTIVATE_SEC:
             return
         if not ACTIVE:
@@ -198,6 +207,39 @@ def main():
         print("[startup] clap detector running")
     except Exception as e:
         print(f"[startup] clap detector failed: {e}")
+
+    # Voice system — starts listening after voice blackout ends
+    global voice_sys, voice_last_transcript, voice_action_label, voice_action_until, last_voice_action_ts
+
+    def _on_voice_state(state: str):
+        # voice system state change: awake/sleep
+        global voice_action_label, voice_action_until
+        label = "NEXO DESPIERTO" if state == "awake" else "NEXO DESCANSA"
+        voice_action_label = label
+        voice_action_until = time.time() + 1.5
+        print(f"[voice] state → {state}")
+
+    def _on_voice_transcript(text: str):
+        global voice_last_transcript
+        voice_last_transcript = text[:60]
+
+    def _on_voice_action(label: str):
+        global voice_action_label, voice_action_until, last_voice_action_ts
+        voice_action_label = label
+        voice_action_until = time.time() + 1.8
+        last_voice_action_ts = time.time()
+        print(f"[voice] action: {label}")
+
+    voice_sys = voice_mod.VoiceSystem(
+        on_state_change=_on_voice_state,
+        on_transcript=_on_voice_transcript,
+        on_action=_on_voice_action,
+    )
+    try:
+        voice_sys.start()
+        print("[startup] voice system running (awaiting 'despierta nexo')")
+    except Exception as e:
+        print(f"[startup] voice system failed: {e}")
 
     while True:
         ok, frame = cap.read()
@@ -258,6 +300,13 @@ def main():
         if ACTIVE and time.time() > ATTENTION_UNTIL and not grab_active:
             deactivate()
 
+        # Voice idle auto-sleep: if voice awake but no command in 30s, auto-sleep it
+        if voice_sys is not None:
+            voice_sys.check_idle_sleep(30.0)
+
+        # Voice dominance over gestures: after a recent voice action, pause gesture actions for 2s
+        voice_dominates = (time.time() - last_voice_action_ts) < VOICE_GESTURE_DOMINANT_SEC
+
         # -------- UNDO: rock with BOTH hands --------
         if ACTIVE and both_rock and not grab_active:
             if both_rock_since is None:
@@ -278,8 +327,8 @@ def main():
         else:
             both_rock_since = None
 
-        # -------- ACTIONS (only when ACTIVE) --------
-        if ACTIVE:
+        # -------- ACTIONS (only when ACTIVE and voice not dominating) --------
+        if ACTIVE and not voice_dominates:
             # GRAB detection: single-hand fist (not both)
             # Cross-screen grab: pick the primary window of the display where the hand is pointing.
             if not grab_active and (gesture_l == "fist") != (gesture_r == "fist"):
@@ -504,8 +553,15 @@ def main():
                 trail_px = [(int(tx * w), int(ty * h)) for _, tx, ty in hand_trail]
                 draw_drag_overlay(frame, (hx, hy), zone, trail_px)
 
-        # Flash in the center
-        draw_action_flash(frame, flash_label, flash_until)
+        # Voice indicator + transcript
+        if voice_sys is not None:
+            draw_voice_indicator(frame, voice_sys.is_awake(), voice_last_transcript if voice_sys.is_awake() else "")
+
+        # Flash in the center (voice action flashes take priority briefly)
+        if time.time() < voice_action_until and voice_action_label:
+            draw_action_flash(frame, voice_action_label, voice_action_until)
+        else:
+            draw_action_flash(frame, flash_label, flash_until)
 
         # Permission banner if missing
         if not HAS_ACCESSIBILITY:
@@ -527,6 +583,11 @@ def main():
 
     try:
         clap_det.stop()
+    except Exception:
+        pass
+    try:
+        if voice_sys is not None:
+            voice_sys.stop()
     except Exception:
         pass
     cap.release()

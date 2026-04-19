@@ -56,7 +56,7 @@ def play_welcome_sequence():
         if p1:
             _current_procs.append(p1)
             p1.wait()
-        p2 = _play_async(ACTIVATION_SONG, duration_sec=35, volume=0.45)
+        p2 = _play_async(ACTIVATION_SONG, duration_sec=20, volume=0.45)
         if p2:
             _current_procs.append(p2)
     threading.Thread(target=run, daemon=True).start()

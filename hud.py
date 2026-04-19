@@ -26,6 +26,29 @@ GESTURE_COLORS = {
 }
 
 
+def draw_voice_indicator(frame, awake: bool, transcript: str = ""):
+    """Pulsing blue circle + transcription when voice is awake."""
+    h, w = frame.shape[:2]
+    cx, cy = w - 40, h // 2
+    if awake:
+        pulse = (time.time() * 2) % 1.0
+        outer_r = int(20 + 10 * abs(0.5 - pulse) * 2)
+        cv2.circle(frame, (cx, cy), outer_r, (255, 200, 80), 2, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), 12, (255, 220, 120), -1, cv2.LINE_AA)
+        cv2.putText(frame, "NEXO", (cx - 22, cy + 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 220, 120), 1, cv2.LINE_AA)
+    else:
+        cv2.circle(frame, (cx, cy), 8, (80, 80, 90), -1, cv2.LINE_AA)
+
+    if transcript:
+        # Show transcript near bottom-right
+        text = transcript[:50]
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+        y = h - 60
+        cv2.putText(frame, f'"{text}"', (w - text_size[0] - 40, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 200, 255), 1, cv2.LINE_AA)
+
+
 def draw_status(frame, active: bool, attention_until: float,
                 gesture_l: str | None, gesture_r: str | None,
                 grabbed_app: str | None):
@@ -93,12 +116,14 @@ def draw_side_legend(frame, side: str):
             (None, "abajo-izq", ">> IZQ"),
             (None, "abajo-der", ">> DER"),
             (None, "rock 2m", "UNDO"),
+            ("VOZ", None, None),
+            (None, "despierta nexo", "ON"),
+            (None, "descansa nexo", "OFF"),
+            (None, "abre/escribe/busca", "comandos"),
             ("SISTEMA", None, None),
-            (None, "rock L", "desktop <-"),
-            (None, "rock R", "desktop ->"),
-            (None, "ok hold 1s", "cmd + tab"),
-            ("CURSOR", None, None),
-            (None, "apuntar 0.8s", "teleport"),
+            (None, "rock L/R", "desktop"),
+            (None, "ok hold", "cmd+tab"),
+            (None, "apuntar 0.8s", "cursor"),
         ]
 
     y0 = 100

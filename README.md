@@ -16,11 +16,12 @@ Built by [Demian Olmedo](https://agentesnexo.com) for AgentesNexo using Claude C
 - **Cross-screen grab**: point at a display, close your fist → you grab the topmost window on that screen automatically. No click needed.
 - **Throw velocity**: flick your hand in a direction as you open to release, and the window follows that direction (not just the final hand position).
 - **Cursor handoff**: while gestures are active, aim at another display for 0.8 s and the mouse cursor teleports to its center.
-- **Smart cooldowns**: state transitions, gesture hold thresholds, and post-grab grace windows to eliminate the usual flaky-detection headaches.
+- **Voice commands**: wake with "despierta nexo", speak natural commands (open apps, type in specific windows, search, media controls). Whisper tiny local wake-word detection + Gemini Flash function calling. Bilingual ES+EN.
+- **Smart cooldowns**: state transitions, gesture hold thresholds, post-grab grace, voice dominance over gestures.
 - **Double-clap activation**: the mic is always listening for a double clap (Jarvis-style "hey, listen"). Falls back to a visual two-hand spread if you prefer.
-- **Iron Man audio cues**: custom `welcome.wav` → 35 s of *Should I Stay or Should I Go* on activate, `seeya.wav` on deactivate.
+- **Iron Man audio cues**: custom `welcome.wav` → 20 s of activation music, `seeya.wav` on deactivate.
 - **Always-on-top HUD** so the preview stays visible even when you focus another app.
-- **Side legend**: all gesture bindings rendered as cheat-sheet columns on both sides of the camera preview.
+- **Side legend**: all gesture and voice bindings rendered as cheat-sheet columns on both sides of the camera preview.
 
 ## Requirements
 
@@ -119,14 +120,42 @@ Zones (using your camera as reference, frame flipped horizontally):
 
 Point at a display different from where your mouse currently lives for 0.8 s and the cursor teleports to its center. No click. Smart cooldown: won't re-teleport to the same display until your hand physically exits that zone.
 
+### Voice commands
+
+Wake with "**despierta nexo**", sleep with "**descansa nexo**". Voice activates 30 seconds after system wake (avoids self-triggering by the activation music).
+
+Commands the system understands (bilingual ES + EN):
+
+| Example phrase | Action |
+|---|---|
+| "abre youtube.com" | Open URL |
+| "abre Spotify" | Open app |
+| "escribe hola cómo estás" | Type text in active window |
+| "escribe en terminal de claude-demian, ejecuta git status" | Type in named window |
+| "... y envía" / "... y ejecuta" | Adds Enter at the end |
+| "busca recetas de pizza" | New Google search tab |
+| "pausa" / "reproduce" / "siguiente" | Media controls |
+| "copia" / "pega" | Cmd+C / Cmd+V |
+
+**Security (4 tiers):**
+1. Auto-execute: apps, URLs, media, typing without Enter
+2. Type-only: terminal commands are typed but you press Enter
+3. Type + Enter: requires explicit "y envía" or "y ejecuta" in the phrase
+4. Blocked: `rm`, `sudo`, `chmod`, `dd`, `curl | sh`, `>` redirect (typed but never sent automatically)
+
+**Auto-sleep:** 30 seconds without a valid command → voice returns to standby.
+
+**Voice dominates gestures:** after a voice action, gesture actions pause for 2 seconds to avoid collision.
+
 ## Architecture
 
 - `gestures.py` — pure MediaPipe detector, 9 discrete gestures with simple geometric rules.
 - `windows.py` — `pyobjc` + Accessibility API + Core Graphics for enumerating displays, finding topmost window on a display, and moving windows.
 - `media.py` — `pynput` for HID media keys (works reliably with web-based media, which AppleScript key codes do not), `osascript` for desktop switching and volume.
 - `audio.py` — `afplay` (native macOS) for non-blocking audio playback, `sounddevice` for double-clap detection with RMS peak + timing window heuristic.
-- `hud.py` — `OpenCV` overlay drawing: status bar, side legends, action flash, drag overlay with trail, permission banner.
-- `main.py` — the state machine: attention mode, grab lifecycle, cursor handoff, action cooldowns, flickering tolerance.
+- `voice.py` — `faster-whisper` (local tiny model) for wake-word detection and command transcription, `google-genai` for function-calling dispatch via Gemini Flash.
+- `hud.py` — `OpenCV` overlay drawing: status bar, side legends, action flash, drag overlay with trail, voice indicator, permission banner.
+- `main.py` — the state machine: attention mode, grab lifecycle, cursor handoff, voice dominance, action cooldowns, flickering tolerance.
 
 ## Known limitations
 

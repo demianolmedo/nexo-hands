@@ -6,3 +6,7 @@ pyobjc-framework-Cocoa==10.3.2
 pyobjc-framework-Quartz==10.3.2
 pyobjc-framework-ApplicationServices==10.3.2
 setuptools<81
+pynput==1.8.1
+sounddevice==0.5.5
+faster-whisper
+google-genai
