@@ -37,18 +37,15 @@ load_dotenv(_HERE / ".env")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 SAMPLE_RATE = 16000
-LIVE_MODEL = "gemini-live-2.5-flash-preview"   # latest live-capable model
-FALLBACK_MODEL = "gemini-2.0-flash-exp"
+# Models verified available with the user's key (Apr 2026):
+LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
+FALLBACK_MODEL = "gemini-flash-latest"
 
-WAKE_WORDS_OPEN = (
-    "despierta nexo", "despierta, nexo", "nexo despierta",
-    "despiertan exo", "despierta neso", "despierta nueso",  # whisper mis-hear variants
-    "despierte nexo", "despierta necho",
-)
-WAKE_WORDS_CLOSE = (
-    "descansa nexo", "descansa, nexo", "nexo descansa",
-    "descansa neso", "descansa necho", "descansan exo",
-)
+# Wake words use "ivan" (user's preference over "nexo"). Whisper tiny often
+# mistranscribes names; we fuzzy-match a wake verb stem + a name variant.
+NAME_VARIANTS = ("ivan", "iván", "ibán", "iban", "ibam", "eban")
+OPEN_VERBS = ("despierta", "despierte", "despierto", "despiertan")
+CLOSE_VERBS = ("descansa", "descanse", "descansan", "descanza", "descanzan")
 
 
 # ----------------- FUNCTION DECLARATIONS -----------------
@@ -362,15 +359,17 @@ class GeminiLiveSession:
         )
 
         config = {
-            "response_modalities": ["TEXT"],
+            # native-audio model requires AUDIO output modality
+            "response_modalities": ["AUDIO"],
             "tools": TOOLS,
             "system_instruction": (
-                "Eres Nexo, un asistente de voz para macOS que interpreta comandos "
-                "de voz y ejecuta funciones. Cuando el usuario pida algo que matche "
-                "alguna función disponible, llámala. Para queries de información "
-                "(dime, dame, explica), usa query_web. Las funciones type_text y "
-                "type_in_window NO presionan Enter por defecto. Solo cuando el "
-                "usuario diga 'y envía', 'y ejecuta', 'y manda' poné press_enter=True."
+                "Eres Ivan, asistente de voz en macOS. Interpretás voz del usuario "
+                "y ejecutás funciones. Cuando el usuario pida algo que matche alguna "
+                "función disponible, llamála sin narrar de más. Para queries de "
+                "información (dime, dame, explica), usá query_web. Las funciones "
+                "type_text y type_in_window NO presionan Enter por defecto; solo si "
+                "el usuario dice 'y envía' / 'y ejecuta' / 'y manda' usá press_enter=True. "
+                "Respondé en español, con voz breve y amable."
             ),
         }
 
@@ -459,8 +458,13 @@ class GeminiLiveSession:
         except Exception:
             pass
 
+    # Defensive rate limit so transient Gemini errors don't hammer the HUD
+    _last_err_flash_at: float = 0.0
+
     def send_text_command(self, text: str):
-        """Fallback: transcribe + non-Live Gemini with tools."""
+        """Fallback: non-Live Gemini with tools. Skip if model unavailable."""
+        if not self.api_key:
+            return
         try:
             client = genai.Client(api_key=self.api_key)
             response = client.models.generate_content(
@@ -468,8 +472,9 @@ class GeminiLiveSession:
                 contents=text,
                 config=genai_types.GenerateContentConfig(
                     system_instruction=(
-                        "Eres Nexo. Identifica qué función ejecutar. Solo press_enter=True "
-                        "si el usuario dice 'y envía' o 'y ejecuta'."
+                        "Eres Ivan. Identifica qué función ejecutar según la voz del usuario. "
+                        "Solo press_enter=True si el usuario dice 'y envía' o 'y ejecuta'. "
+                        "Si no hay función clara, no llames nada."
                     ),
                     tools=TOOLS,
                 ),
@@ -488,7 +493,11 @@ class GeminiLiveSession:
                                 self.on_action(f"ERROR {fc.name}: {e}")
                                 return
         except Exception as e:
-            self.on_action(f"GEMINI ERR: {str(e)[:60]}")
+            import time as _t
+            now = _t.time()
+            if now - self._last_err_flash_at > 5.0:
+                self._last_err_flash_at = now
+                self.on_action(f"GEMINI ERR: {str(e)[:80]}")
 
     def is_fallback(self) -> bool:
         return self._fallback_mode
@@ -565,16 +574,15 @@ class VoiceSystem:
                 continue
 
             self.on_transcript(text[:60])
-            print(f"[voice] heard: {text!r}")  # debug aid — so the user can see what Whisper is hearing
+            print(f"[voice] heard: {text!r}")
 
-            # Fuzzy wake-word match: require "nexo" / "neso" / "necho" + a wake-verb stem
-            has_nexo = any(tok in text for tok in ("nexo", "neso", "necho", "nueso"))
-            has_open = any(tok in text for tok in ("despierta", "despierte", "despierto", "despiertan"))
-            has_close = any(tok in text for tok in ("descansa", "descanse", "descansan"))
+            has_name = any(n in text for n in NAME_VARIANTS)
+            has_open_verb = any(v in text for v in OPEN_VERBS)
+            has_close_verb = any(v in text for v in CLOSE_VERBS)
 
-            if not self._awake and has_nexo and has_open:
+            if not self._awake and has_name and has_open_verb:
                 self._activate()
-            elif self._awake and has_nexo and has_close:
+            elif self._awake and has_name and has_close_verb:
                 self._deactivate()
             elif self._awake and now - self._last_command_at > 3.0:
                 self._last_command_at = now

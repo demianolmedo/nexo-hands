@@ -29,8 +29,8 @@ POST_GRAB_GRACE_SEC = 1.2       # ignore other gestures briefly after a grab/rel
 POINTER_HANDOFF_HOLD_SEC = 0.8
 POINTER_HANDOFF_COOLDOWN_SEC = 1.5
 STATE_CHANGE_COOLDOWN_SEC = 1.5  # min gap between toggles of the same layer
-CLAP_BLACKOUT_AFTER_ACTIVATE_SEC = 30.0  # clap ignored during activation music
-VOICE_BLACKOUT_AFTER_ACTIVATE_SEC = 30.0
+CLAP_BLACKOUT_AFTER_ACTIVATE_SEC = 15.0  # clap ignored during activation music (now 10s)
+VOICE_BLACKOUT_AFTER_ACTIVATE_SEC = 15.0
 VOICE_GESTURE_DOMINANT_SEC = 2.0
 DESCANSA_SILENCE_REQUIRED_SEC = 0.5  # require this much silence before acting on "descansa nexo"
 
