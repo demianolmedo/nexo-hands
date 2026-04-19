@@ -131,9 +131,26 @@ def _focus_pid(pid: int):
 
 
 def _speak_mac(text: str, voice: str = "Monica"):
+    """Speak `text` and BLOCK until done. Blocking is on purpose: the caller
+    (exec_query_web) runs inside the dispatch thread, and we want the
+    STATE_SPEAKING flag to stay set until audio actually ends — otherwise the
+    scan loop wakes up mid-utterance, picks up our own voice via the mic, and
+    echoes back another Gemini call. Also kills any previous `say` / `afplay`
+    (activation music, prior reply) so nothing overlaps."""
     try:
-        subprocess.Popen(["say", "-v", voice, text[:500]],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "-f", r"^say\b"], capture_output=True, timeout=1)
+    except Exception:
+        pass
+    try:
+        subprocess.run(["pkill", "-f", "afplay"], capture_output=True, timeout=1)
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["say", "-v", voice, text[:500]],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
     except Exception:
         pass
 
@@ -815,11 +832,19 @@ class VoiceSystem:
                 continue
             last_check = now
 
+            # If Gemini is thinking or we're speaking, don't transcribe — our
+            # own TTS would be picked up by the mic and cause an echo loop
+            # (double audio, runaway Gemini calls, eventually SIGTRAP).
+            cur_state = self.get_processing_state()
+            if cur_state in (self.STATE_THINKING, self.STATE_SPEAKING):
+                self.audio_buf.buf[:] = 0.0  # drop whatever we captured of ourselves
+                continue
+
             audio = self.audio_buf.snapshot()
             is_silent = np.max(np.abs(audio)) < 0.01
             # Only toggle IDLE/LISTEN based on voice activity; don't stomp on
             # THINKING/SPEAKING states driven by the dispatch thread.
-            if self.get_processing_state() in (self.STATE_IDLE, self.STATE_LISTEN):
+            if cur_state in (self.STATE_IDLE, self.STATE_LISTEN):
                 self._set_state(self.STATE_IDLE if is_silent else self.STATE_LISTEN)
             if is_silent:
                 continue
@@ -876,7 +901,16 @@ class VoiceSystem:
                         try:
                             if self._live and self._live.is_fallback():
                                 self._live.send_text_command(t)
+                        except Exception as e:
+                            print(f"[voice] dispatch error: {e}")
                         finally:
+                            # Drain any echo we captured of ourselves while
+                            # Gemini/say were running before reopening the mic.
+                            try:
+                                self.audio_buf.buf[:] = 0.0
+                            except Exception:
+                                pass
+                            self._last_command_at = time.time()
                             self._set_state(self.STATE_IDLE)
                     threading.Thread(target=_dispatch, daemon=True).start()
 
