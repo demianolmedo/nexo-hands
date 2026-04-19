@@ -658,15 +658,20 @@ class VoiceSystem:
         self._awake = True
         self._last_activity = time.time()
         self._last_command_at = time.time()
-        if GEMINI_API_KEY and self._live is None:
+        # Text mode by default — Live API (gemini-3.1-flash-live-preview with AUDIO
+        # modality) is currently unstable in the google-genai preview SDK on this
+        # stack (SIGTRAP after processing the first command). We stick with
+        # Whisper-local transcription + generate_content until the SDK stabilizes.
+        if GEMINI_API_KEY:
+            # Dummy session object so send_text_command is callable via _live
             self._live = GeminiLiveSession(
                 api_key=GEMINI_API_KEY,
                 on_action=self.on_action,
                 on_transcript=self.on_transcript,
             )
-            self._live.start()
+            self._live._fallback_mode = True  # force non-Live path
         self.on_state_change("awake")
-        print("[voice] WAKE")
+        print("[voice] WAKE (text mode)")
 
     def _deactivate(self):
         if not self._awake:
