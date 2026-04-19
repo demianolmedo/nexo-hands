@@ -282,24 +282,40 @@ def exec_search_google(query: str) -> str:
     return f"SEARCH {query[:40]}"
 
 
+def _press_media_key_isolated(key_name: str) -> None:
+    """Press a media key in a fresh subprocess. pynput on macOS creates
+    CGEventTaps via Quartz which can SIGTRAP when invoked from a daemon
+    thread of a process that already has an NSApplication running (OpenCV
+    main loop). Isolating into a one-shot subprocess means any such crash
+    only kills the helper, not our voice/gesture main loop."""
+    import sys as _sys
+    code = (
+        "from pynput.keyboard import Key, Controller;"
+        "c = Controller();"
+        f"c.press(Key.{key_name}); c.release(Key.{key_name})"
+    )
+    try:
+        subprocess.run(
+            [_sys.executable, "-c", code],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=4,
+        )
+    except Exception as e:
+        print(f"[voice] media key '{key_name}' subprocess failed: {e}")
+
+
 def exec_play_pause() -> str:
-    from pynput.keyboard import Key, Controller
-    kb = Controller()
-    kb.press(Key.media_play_pause); kb.release(Key.media_play_pause)
+    _press_media_key_isolated("media_play_pause")
     return "PLAY/PAUSE"
 
 
 def exec_next_track() -> str:
-    from pynput.keyboard import Key, Controller
-    kb = Controller()
-    kb.press(Key.media_next); kb.release(Key.media_next)
+    _press_media_key_isolated("media_next")
     return "NEXT"
 
 
 def exec_previous_track() -> str:
-    from pynput.keyboard import Key, Controller
-    kb = Controller()
-    kb.press(Key.media_previous); kb.release(Key.media_previous)
+    _press_media_key_isolated("media_previous")
     return "PREV"
 
 
