@@ -41,6 +41,20 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Environment setup (required for voice commands)
+
+Voice commands (Gemini Live Preview + TTS fallback) need a Gemini API key. Get
+a free one at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).
+
+```bash
+cp .env.example .env
+# Edit .env and paste your key:
+#   GEMINI_API_KEY=AIzaSy...
+```
+
+**Never commit `.env`.** It's in `.gitignore`. If you accidentally expose your
+key, revoke it immediately at aistudio.google.com and regenerate.
+
 ### Audio assets (bring your own)
 
 For copyright reasons, the activation/deactivation audio is **not** in the repo. Drop these three files into `assets/`:
