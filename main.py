@@ -1,4 +1,15 @@
-"""Gesture-control main loop: camera → gestures → OS actions."""
+"""Gesture-control main loop: camera → gestures → OS actions.
+
+Modos (bandera CLI):
+  python main.py                   → cámara + mic (default, todo activo)
+  python main.py --no-voice        → solo gestos, ni abre el mic ni importa voice.py
+  python main.py --no-gestures     → solo voz, ni abre cámara ni carga MediaPipe
+
+Aislamiento por hardware: cada flag hace que el subsistema desactivado NO toque
+su dispositivo (mic/cámara), así no hay contención incluso si corrés las dos
+invocaciones en paralelo.
+"""
+import argparse
 import sys
 import time
 import threading
@@ -12,14 +23,33 @@ for _sig in (_signal.SIGTRAP, _signal.SIGABRT, _signal.SIGBUS, _signal.SIGSEGV):
         faulthandler.register(_sig, chain=False)
     except Exception:
         pass
-import cv2
-import mediapipe as mp
 
-from gestures import detect_gesture
+# ---- CLI flags (before heavy imports so --no-gestures skips MediaPipe load) ----
+_parser = argparse.ArgumentParser(description="nexo-hands")
+_parser.add_argument("--no-voice", action="store_true",
+                     help="Deshabilita voz/mic. Solo gestos.")
+_parser.add_argument("--no-gestures", action="store_true",
+                     help="Deshabilita cámara/gestos. Solo voz.")
+ARGS = _parser.parse_args()
+
+if ARGS.no_voice and ARGS.no_gestures:
+    print("Nada que hacer: ambos subsistemas deshabilitados.")
+    sys.exit(0)
+
+import cv2
+import numpy as np
+
+# MediaPipe solo se carga si gestos están habilitados (ahorro de RAM/CPU)
+if not ARGS.no_gestures:
+    import mediapipe as mp
+    from gestures import detect_gesture
+
 import media
 import windows
 import audio as audio_mod
-import voice as voice_mod
+# voice.py (faster-whisper, 80MB+) solo se importa si la voz está activa
+if not ARGS.no_voice:
+    import voice as voice_mod
 from hud import (
     draw_status, draw_drag_overlay,
     draw_side_legend, draw_action_log, draw_permission_banner,
@@ -77,8 +107,8 @@ last_activate_ts: float = 0.0  # last time voice activated (for clap blackout)
 pending_voice_wake: bool = False  # "despierta nexo" heard mid-grab, apply after grab ends
 voice_last_activity_ts: float = 0.0  # last voice command (for idle timeout)
 
-# Voice system
-voice_sys: voice_mod.VoiceSystem | None = None
+# Voice system (Any — voice_mod puede no estar importado en modo --no-voice)
+voice_sys = None
 last_voice_action_ts: float = 0.0
 voice_last_transcript: str = ""
 voice_action_label: str = ""
@@ -222,26 +252,36 @@ def main():
     global pending_voice_wake, voice_last_activity_ts
     global hands_first_seen_ts
 
+    # --- Cámara: solo si gestos están activos. En modo --no-gestures, el HUD
+    # se renderiza sobre un frame negro liso (no abrimos el dispositivo). ---
     cap = None
-    for cam_idx in range(4):
-        test = cv2.VideoCapture(cam_idx)
-        if test.isOpened():
-            ok, _ = test.read()
-            if ok:
-                cap = test
-                print(f"[camera] using device index {cam_idx}")
-                break
-            test.release()
-        else:
-            test.release()
-    if cap is None:
-        print("Error: no working camera found (tried indices 0-3)")
-        sys.exit(1)
+    if not ARGS.no_gestures:
+        for cam_idx in range(4):
+            test = cv2.VideoCapture(cam_idx)
+            if test.isOpened():
+                ok, _ = test.read()
+                if ok:
+                    cap = test
+                    print(f"[camera] using device index {cam_idx}")
+                    break
+                test.release()
+            else:
+                test.release()
+        if cap is None:
+            print("Error: no working camera found (tried indices 0-3)")
+            sys.exit(1)
 
-    cv2.namedWindow('Gesture Control', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('Gesture Control', 960, 540)
+    # Window title cambia según modo para que Mission Control las distinga
+    WINDOW_TITLE = (
+        "nexo-voice" if ARGS.no_gestures
+        else "nexo-gestures" if ARGS.no_voice
+        else "nexo-hands"
+    )
+    _WIN_W, _WIN_H = (640, 360) if ARGS.no_gestures else (960, 540)
+    cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_TITLE, _WIN_W, _WIN_H)
     try:
-        cv2.setWindowProperty('Gesture Control', cv2.WND_PROP_TOPMOST, 1)
+        cv2.setWindowProperty(WINDOW_TITLE, cv2.WND_PROP_TOPMOST, 1)
     except Exception:
         pass
 
@@ -251,7 +291,7 @@ def main():
             from AppKit import NSApp
             for ww in NSApp.windows():
                 try:
-                    if 'Gesture Control' in str(ww.title()):
+                    if WINDOW_TITLE in str(ww.title()):
                         ww.setLevel_(3)  # NSFloatingWindowLevel
                 except Exception:
                     continue
@@ -260,20 +300,21 @@ def main():
 
     last_topmost_refresh = 0.0
 
-    mp_hands = mp.solutions.hands
-    mp_draw = mp.solutions.drawing_utils
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=2,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.5,
-    )
-
-    # SelfieSegmentation: separa persona de fondo para poder blurrear solo el
-    # fondo y dejar al usuario nítido (estilo bokeh / videollamada pro).
-    mp_selfie = mp.solutions.selfie_segmentation
-    selfie = mp_selfie.SelfieSegmentation(model_selection=1)
-    import numpy as _np
+    # --- MediaPipe: solo carga si gestos están activos ---
+    if not ARGS.no_gestures:
+        mp_hands = mp.solutions.hands
+        mp_draw = mp.solutions.drawing_utils
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5,
+        )
+        # SelfieSegmentation: persona nítida, fondo blur.
+        mp_selfie = mp.solutions.selfie_segmentation
+        selfie = mp_selfie.SelfieSegmentation(model_selection=1)
+    else:
+        mp_hands = mp_draw = hands = mp_selfie = selfie = None
 
     # Permission check (runs once)
     HAS_ACCESSIBILITY = windows.check_accessibility_permission()
@@ -342,54 +383,60 @@ def main():
     def _on_voice_thinking(label: str):
         console_push("think", label)
 
-    voice_sys = voice_mod.VoiceSystem(
-        on_state_change=_on_voice_state,
-        on_transcript=_on_voice_transcript,
-        on_action=_on_voice_action,
-        on_thinking=_on_voice_thinking,
-    )
-    try:
-        voice_sys.start()
-        print("[startup] voice system running (wake: 'despierta' / sleep: 'descansa')")
-    except Exception as e:
-        print(f"[startup] voice system failed: {e}")
+    # --- Voz: solo si --no-voice NO está. En modo solo-gestos el mic ni se
+    # abre (voice_mod no fue ni importado). ---
+    if not ARGS.no_voice:
+        voice_sys = voice_mod.VoiceSystem(
+            on_state_change=_on_voice_state,
+            on_transcript=_on_voice_transcript,
+            on_action=_on_voice_action,
+            on_thinking=_on_voice_thinking,
+        )
+        try:
+            voice_sys.start()
+            print("[startup] voice system running (wake: 'despierta' / sleep: 'descansa')")
+        except Exception as e:
+            print(f"[startup] voice system failed: {e}")
+    else:
+        voice_sys = None
+        print("[startup] voice DISABLED (--no-voice)")
 
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        frame = cv2.flip(frame, 1)
+        # --- Frame source: cámara (modo gestos) o canvas negro (modo voz) ---
+        if cap is not None:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame = cv2.flip(frame, 1)
+        else:
+            # Sin cámara: canvas liso para el HUD de voz. Tamaño matching window.
+            frame = np.zeros((_WIN_H, _WIN_W, 3), dtype=np.uint8)
+            # Pequeño gradiente radial sutil para que no sea negro puro
+            frame[:] = (18, 12, 8)
         h, w, _ = frame.shape
 
-        # Run MediaPipe on the ORIGINAL (sharp) frame before we blur it —
-        # landmark detection degrades on blurred input.
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = hands.process(rgb)
-
-        # SelfieSeg: mask of the user (1.0=person, 0.0=background).
-        # We composite: person SHARP, background BLURRED + darkened heavily
-        # (≈98% glass-frosted feel requested).
-        seg = selfie.process(rgb)
-        mask = seg.segmentation_mask  # float HxW in [0,1]
-        # Soften the mask edges so the composite doesn't look cut-out
-        mask = cv2.GaussianBlur(mask, (15, 15), 0)
-        mask = _np.clip(mask, 0.0, 1.0)
-        mask3 = _np.repeat(mask[:, :, None], 3, axis=2)
-        # Heavy blur for background. Kernel 151 = máximo práctico (vidrio
-        # esmerilado extremo). Cuesta ~12ms por frame en 960x540.
-        bg = cv2.GaussianBlur(frame, (151, 151), 0)
-        # Darken heavily so user pops (negro casi vidrio oscuro)
-        bg = cv2.addWeighted(bg, 0.55, bg, 0.0, -50)
-        # Composite: sharp person over blurred-dark bg
-        frame = (frame.astype(_np.float32) * mask3 +
-                 bg.astype(_np.float32) * (1.0 - mask3)).astype(_np.uint8)
+        # MediaPipe y blur solo si gestos están activos
+        result = None
+        if hands is not None:
+            # MediaPipe sobre frame SHARP antes del blur
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            result = hands.process(rgb)
+            # SelfieSeg: persona nítida, fondo blur.
+            seg = selfie.process(rgb)
+            mask = seg.segmentation_mask
+            mask = cv2.GaussianBlur(mask, (15, 15), 0)
+            mask = np.clip(mask, 0.0, 1.0)
+            mask3 = np.repeat(mask[:, :, None], 3, axis=2)
+            bg = cv2.GaussianBlur(frame, (151, 151), 0)
+            bg = cv2.addWeighted(bg, 0.55, bg, 0.0, -50)
+            frame = (frame.astype(np.float32) * mask3 +
+                     bg.astype(np.float32) * (1.0 - mask3)).astype(np.uint8)
 
         left_hand = None
         right_hand = None
         # Track when hands first enter the view — used to debounce accidental
         # actions in the first ~700ms of tracking while MediaPipe stabilizes.
-        if result.multi_hand_landmarks:
+        if result and result.multi_hand_landmarks:
             if hands_first_seen_ts == 0.0:
                 hands_first_seen_ts = time.time()
         else:
@@ -400,7 +447,7 @@ def main():
         )
         # Dim landmarks when voice is dominant (gestures paused)
         gestures_paused = voice_active and gestures_enabled
-        if result.multi_hand_landmarks:
+        if result and result.multi_hand_landmarks:
             for lm in result.multi_hand_landmarks:
                 if gestures_paused:
                     # Draw on a separate buffer then blend with 40% alpha
@@ -744,13 +791,13 @@ def main():
         if not HAS_ACCESSIBILITY:
             draw_permission_banner(frame)
 
-        cv2.imshow('Gesture Control', frame)
+        cv2.imshow(WINDOW_TITLE, frame)
 
         # Refresh topmost level every 2s (may lose it when other apps activate)
         if time.time() - last_topmost_refresh > 2.0:
             _force_topmost()
             try:
-                cv2.setWindowProperty('Gesture Control', cv2.WND_PROP_TOPMOST, 1)
+                cv2.setWindowProperty(WINDOW_TITLE, cv2.WND_PROP_TOPMOST, 1)
             except Exception:
                 pass
             last_topmost_refresh = time.time()
@@ -767,7 +814,8 @@ def main():
             voice_sys.stop()
     except Exception:
         pass
-    cap.release()
+    if cap is not None:
+        cap.release()
     cv2.destroyAllWindows()
 
 
