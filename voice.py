@@ -44,8 +44,8 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 SAMPLE_RATE = 16000
 # Gemini 3.1 Flash — newest generation available (verified via API Apr 2026)
-LIVE_MODEL = "gemini-3.1-flash-live-preview"          # WebSocket Live API, bidi audio
-FALLBACK_MODEL = "gemini-3.1-flash-lite-preview"      # standard generate_content path
+LIVE_MODEL = "gemini-3.5-flash"                        # WebSocket Live API, bidi audio
+FALLBACK_MODEL = "gemini-3.5-flash"                   # standard generate_content path
 
 # Wake words — single verbs, no name.
 # OPEN  = "despierta"  (any inflection)
